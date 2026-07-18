@@ -1,8 +1,11 @@
 // Package router sniffs incoming AWS-style requests and dispatches them to
-// the correct service handler. Two wire protocols are supported on the same
-// port: the JSON protocol (Textract-style, identified by the X-Amz-Target
-// header) and the Query protocol (SQS/SNS-style, form-encoded with an
-// Action parameter).
+// the correct service handler. Three wire protocols are supported on the
+// same port: the JSON protocol (Textract-style, identified by the
+// X-Amz-Target header), the Query protocol (SQS/SNS-style, form-encoded
+// with an Action parameter), and the REST protocol (S3-style, with no
+// Action/Target and the operation instead selected by HTTP method, URL
+// path, and query-string subresources), which is tried as a fallback once
+// neither of the other two match.
 package router
 
 import (
@@ -12,10 +15,12 @@ import (
 )
 
 // Multiplexer dispatches requests by protocol: X-Amz-Target header for the
-// JSON protocol, form-encoded Action for the Query protocol.
+// JSON protocol, form-encoded Action for the Query protocol, and a REST
+// fallback handler for everything else.
 type Multiplexer struct {
-	jsonRoutes  map[string]http.HandlerFunc
-	queryRoutes map[string]http.HandlerFunc
+	jsonRoutes   map[string]http.HandlerFunc
+	queryRoutes  map[string]http.HandlerFunc
+	restFallback http.Handler
 }
 
 // NewMultiplexer returns an empty Multiplexer ready for route registration.
@@ -38,6 +43,13 @@ func (m *Multiplexer) RegisterQueryAction(action string, h http.HandlerFunc) {
 	m.queryRoutes[action] = h
 }
 
+// RegisterRESTFallback registers the handler for REST-protocol services
+// (currently S3), tried once a request carries neither an X-Amz-Target
+// header nor a Query-protocol Action parameter.
+func (m *Multiplexer) RegisterRESTFallback(h http.Handler) {
+	m.restFallback = h
+}
+
 // ServeHTTP implements http.Handler, sniffing the protocol and dispatching
 // accordingly.
 func (m *Multiplexer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -56,11 +68,20 @@ func (m *Multiplexer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	action := r.FormValue("Action")
-	h, ok := m.queryRoutes[action]
-	if action == "" || !ok {
-		awsutil.WriteXMLError(w, http.StatusBadRequest, "Sender", "InvalidAction", "unknown or missing Action: "+action)
+	if action := r.FormValue("Action"); action != "" {
+		h, ok := m.queryRoutes[action]
+		if !ok {
+			awsutil.WriteXMLError(w, http.StatusBadRequest, "Sender", "InvalidAction", "unknown Action: "+action)
+			return
+		}
+		h(w, r)
 		return
 	}
-	h(w, r)
+
+	if m.restFallback != nil {
+		m.restFallback.ServeHTTP(w, r)
+		return
+	}
+
+	awsutil.WriteXMLError(w, http.StatusBadRequest, "Sender", "InvalidAction", "missing Action")
 }

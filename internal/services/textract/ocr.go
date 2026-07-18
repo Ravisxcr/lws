@@ -62,7 +62,12 @@ func EncodeToBytes(m *gocv.Mat) ([]byte, error) {
 		return nil, fmt.Errorf("encode image: %w", err)
 	}
 	defer buf.Close()
-	return buf.GetBytes(), nil
+	// buf.GetBytes() aliases the native buffer's backing memory rather than
+	// copying it, so it must be copied out before buf.Close() frees that
+	// memory out from under the returned slice.
+	out := make([]byte, buf.Len())
+	copy(out, buf.GetBytes())
+	return out, nil
 }
 
 // OCRWord is a single OCR'd word with its pixel bounding box and confidence.

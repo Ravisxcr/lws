@@ -1,8 +1,8 @@
 services:
   emulator:
     build:
-      context: ..
-      dockerfile: deployments/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     environment:
       - PORT=4566
     ports:

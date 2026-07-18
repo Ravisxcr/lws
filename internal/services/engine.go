@@ -4,6 +4,7 @@
 package services
 
 import (
+	"lws/internal/services/s3"
 	"lws/internal/services/sns"
 	"lws/internal/services/sqs"
 	"lws/internal/services/textract"
@@ -19,6 +20,9 @@ type Engine struct {
 
 	TextractProcessor *textract.Processor
 	TextractHandler   *textract.Handler
+
+	S3Service *s3.Service
+	S3Handler *s3.Handler
 }
 
 // NewEngine constructs every service and wires SNS's SQS fan-out to the
@@ -33,6 +37,9 @@ func NewEngine() *Engine {
 	textractProc := textract.NewProcessor()
 	textractHandler := textract.NewHandler(textractProc)
 
+	s3Svc := s3.NewService()
+	s3Handler := s3.NewHandler(s3Svc)
+
 	return &Engine{
 		SQSService: sqsSvc,
 		SQSHandler: sqsHandler,
@@ -42,5 +49,8 @@ func NewEngine() *Engine {
 
 		TextractProcessor: textractProc,
 		TextractHandler:   textractHandler,
+
+		S3Service: s3Svc,
+		S3Handler: s3Handler,
 	}
 }

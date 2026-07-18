@@ -24,6 +24,15 @@ func NewRouter(eng *services.Engine) http.Handler {
 	mux.RegisterQueryAction("DeleteQueue", eng.SQSHandler.HandleDeleteQueue)
 	mux.RegisterQueryAction("ListQueues", eng.SQSHandler.HandleListQueues)
 
+	// SQS (JSON protocol) - current AWS SDKs default to this over Query.
+	mux.RegisterJSONAction("AmazonSQS.CreateQueue", eng.SQSHandler.HandleCreateQueueJSON)
+	mux.RegisterJSONAction("AmazonSQS.GetQueueUrl", eng.SQSHandler.HandleGetQueueUrlJSON)
+	mux.RegisterJSONAction("AmazonSQS.SendMessage", eng.SQSHandler.HandleSendMessageJSON)
+	mux.RegisterJSONAction("AmazonSQS.ReceiveMessage", eng.SQSHandler.HandleReceiveMessageJSON)
+	mux.RegisterJSONAction("AmazonSQS.DeleteMessage", eng.SQSHandler.HandleDeleteMessageJSON)
+	mux.RegisterJSONAction("AmazonSQS.DeleteQueue", eng.SQSHandler.HandleDeleteQueueJSON)
+	mux.RegisterJSONAction("AmazonSQS.ListQueues", eng.SQSHandler.HandleListQueuesJSON)
+
 	// SNS (Query protocol)
 	mux.RegisterQueryAction("CreateTopic", eng.SNSHandler.HandleCreateTopic)
 	mux.RegisterQueryAction("DeleteTopic", eng.SNSHandler.HandleDeleteTopic)
@@ -32,6 +41,10 @@ func NewRouter(eng *services.Engine) http.Handler {
 	mux.RegisterQueryAction("Unsubscribe", eng.SNSHandler.HandleUnsubscribe)
 	mux.RegisterQueryAction("ListSubscriptionsByTopic", eng.SNSHandler.HandleListSubscriptionsByTopic)
 	mux.RegisterQueryAction("Publish", eng.SNSHandler.HandlePublish)
+
+	// S3 (REST protocol) - bucket/key in the URL path, dispatched by HTTP
+	// method and query-string subresource rather than an Action/Target.
+	mux.RegisterRESTFallback(eng.S3Handler)
 
 	return mux
 }

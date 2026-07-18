@@ -130,15 +130,36 @@ func (s *Service) ReceiveMessage(queueName string, maxMessages int, waitTime tim
 		waitTime = 0
 	}
 
-	timer := time.NewTimer(waitTime)
-	defer timer.Stop()
-
 	out := make([]*ReceivedMessage, 0, maxMessages)
-	for len(out) < maxMessages {
+
+	// Wait for the first message. A zero waitTime is a short poll: check
+	// once without blocking, rather than racing a zero-duration timer
+	// against the channel (which, with a message already buffered, would
+	// nondeterministically pick the timer and drop the message).
+	if waitTime == 0 {
+		select {
+		case msg := <-q.ready:
+			out = append(out, s.markInFlight(q, msg))
+		default:
+			return out, nil
+		}
+	} else {
+		timer := time.NewTimer(waitTime)
+		defer timer.Stop()
 		select {
 		case msg := <-q.ready:
 			out = append(out, s.markInFlight(q, msg))
 		case <-timer.C:
+			return out, nil
+		}
+	}
+
+	// Greedily drain any additional already-ready messages without waiting further.
+	for len(out) < maxMessages {
+		select {
+		case msg := <-q.ready:
+			out = append(out, s.markInFlight(q, msg))
+		default:
 			return out, nil
 		}
 	}

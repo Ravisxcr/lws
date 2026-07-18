@@ -1,6 +1,7 @@
 package sqs
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"net/http"
@@ -44,8 +45,8 @@ type GetQueueUrlResponse struct {
 }
 
 type SendMessageResult struct {
-	MessageId      string `xml:"MessageId"`
-	MD5OfBody      string `xml:"MD5OfMessageBody"`
+	MessageId string `xml:"MessageId"`
+	MD5OfBody string `xml:"MD5OfMessageBody"`
 }
 type SendMessageResponse struct {
 	XMLName  xml.Name                 `xml:"http://queue.amazonaws.com/doc/2012-11-05/ SendMessageResponse"`
@@ -62,16 +63,16 @@ type MessageAttributeValueXML struct {
 	StringValue string `xml:"StringValue,omitempty"`
 }
 type MessageAttributeXML struct {
-	Name  string                    `xml:"Name"`
-	Value MessageAttributeValueXML  `xml:"Value"`
+	Name  string                   `xml:"Name"`
+	Value MessageAttributeValueXML `xml:"Value"`
 }
 type MessageXML struct {
-	MessageId        string                 `xml:"MessageId"`
-	ReceiptHandle    string                 `xml:"ReceiptHandle"`
-	MD5OfBody        string                 `xml:"MD5OfBody"`
-	Body             string                 `xml:"Body"`
-	Attribute        []AttributeXML         `xml:"Attribute,omitempty"`
-	MessageAttribute []MessageAttributeXML  `xml:"MessageAttribute,omitempty"`
+	MessageId        string                `xml:"MessageId"`
+	ReceiptHandle    string                `xml:"ReceiptHandle"`
+	MD5OfBody        string                `xml:"MD5OfBody"`
+	Body             string                `xml:"Body"`
+	Attribute        []AttributeXML        `xml:"Attribute,omitempty"`
+	MessageAttribute []MessageAttributeXML `xml:"MessageAttribute,omitempty"`
 }
 type ReceiveMessageResult struct {
 	Message []MessageXML `xml:"Message,omitempty"`
@@ -239,6 +240,228 @@ func (h *Handler) HandleListQueues(w http.ResponseWriter, r *http.Request) {
 		Result:   ListQueuesResult{QueueUrl: urls},
 		Metadata: awsutil.ResponseMetadata{RequestID: awsutil.NewRequestID()},
 	})
+}
+
+// --- JSON-protocol handlers ---
+//
+// Modern AWS SDKs default to SQS's JSON protocol rather than the legacy
+// Query protocol above: requests carry an X-Amz-Target header and a JSON
+// body, and responses are flat JSON with no XML envelope.
+
+type jsonMessageAttributeValue struct {
+	DataType    string `json:"DataType"`
+	StringValue string `json:"StringValue,omitempty"`
+}
+
+type createQueueJSONRequest struct {
+	QueueName  string            `json:"QueueName"`
+	Attributes map[string]string `json:"Attributes,omitempty"`
+}
+
+func (h *Handler) HandleCreateQueueJSON(w http.ResponseWriter, r *http.Request) {
+	var req createQueueJSONRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "InvalidParameterValue", "malformed request body: "+err.Error())
+		return
+	}
+	if req.QueueName == "" {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "MissingParameter", "QueueName is required")
+		return
+	}
+	q, err := h.svc.CreateQueue(req.QueueName, req.Attributes, r.Host)
+	if err != nil {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "InvalidParameterValue", err.Error())
+		return
+	}
+	awsutil.WriteJSON(w, http.StatusOK, map[string]string{"QueueUrl": q.URL})
+}
+
+type getQueueUrlJSONRequest struct {
+	QueueName string `json:"QueueName"`
+}
+
+func (h *Handler) HandleGetQueueUrlJSON(w http.ResponseWriter, r *http.Request) {
+	var req getQueueUrlJSONRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "InvalidParameterValue", "malformed request body: "+err.Error())
+		return
+	}
+	if req.QueueName == "" {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "MissingParameter", "QueueName is required")
+		return
+	}
+	url, err := h.svc.GetQueueURL(req.QueueName)
+	if err != nil {
+		writeQueueErrorJSON(w, err)
+		return
+	}
+	awsutil.WriteJSON(w, http.StatusOK, map[string]string{"QueueUrl": url})
+}
+
+type sendMessageJSONRequest struct {
+	QueueUrl          string                               `json:"QueueUrl"`
+	MessageBody       string                               `json:"MessageBody"`
+	MessageAttributes map[string]jsonMessageAttributeValue `json:"MessageAttributes,omitempty"`
+}
+
+func (h *Handler) HandleSendMessageJSON(w http.ResponseWriter, r *http.Request) {
+	var req sendMessageJSONRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "InvalidParameterValue", "malformed request body: "+err.Error())
+		return
+	}
+	queueName := queueNameFromURL(req.QueueUrl)
+	if queueName == "" || req.MessageBody == "" {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "MissingParameter", "QueueUrl and MessageBody are required")
+		return
+	}
+	var attrs map[string]MessageAttributeValue
+	if len(req.MessageAttributes) > 0 {
+		attrs = make(map[string]MessageAttributeValue, len(req.MessageAttributes))
+		for name, v := range req.MessageAttributes {
+			attrs[name] = MessageAttributeValue{DataType: v.DataType, StringValue: v.StringValue}
+		}
+	}
+	msg, err := h.svc.SendMessage(queueName, req.MessageBody, attrs)
+	if err != nil {
+		writeQueueErrorJSON(w, err)
+		return
+	}
+	awsutil.WriteJSON(w, http.StatusOK, map[string]string{
+		"MessageId":        msg.MessageID,
+		"MD5OfMessageBody": msg.MD5OfBody,
+	})
+}
+
+type receiveMessageJSONRequest struct {
+	QueueUrl            string `json:"QueueUrl"`
+	MaxNumberOfMessages int    `json:"MaxNumberOfMessages"`
+	WaitTimeSeconds     int    `json:"WaitTimeSeconds"`
+}
+
+type jsonMessage struct {
+	MessageId         string                               `json:"MessageId"`
+	ReceiptHandle     string                               `json:"ReceiptHandle"`
+	MD5OfBody         string                               `json:"MD5OfBody"`
+	Body              string                               `json:"Body"`
+	Attributes        map[string]string                    `json:"Attributes,omitempty"`
+	MessageAttributes map[string]jsonMessageAttributeValue `json:"MessageAttributes,omitempty"`
+}
+
+func (h *Handler) HandleReceiveMessageJSON(w http.ResponseWriter, r *http.Request) {
+	var req receiveMessageJSONRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "InvalidParameterValue", "malformed request body: "+err.Error())
+		return
+	}
+	queueName := queueNameFromURL(req.QueueUrl)
+	if queueName == "" {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "MissingParameter", "QueueUrl is required")
+		return
+	}
+	received, err := h.svc.ReceiveMessage(queueName, req.MaxNumberOfMessages, time.Duration(req.WaitTimeSeconds)*time.Second)
+	if err != nil {
+		writeQueueErrorJSON(w, err)
+		return
+	}
+	messages := make([]jsonMessage, 0, len(received))
+	for _, rm := range received {
+		jm := jsonMessage{
+			MessageId:     rm.MessageID,
+			ReceiptHandle: rm.ReceiptHandle,
+			MD5OfBody:     rm.MD5OfBody,
+			Body:          rm.Body,
+			Attributes:    map[string]string{"ApproximateReceiveCount": strconv.Itoa(rm.ReceiveCount)},
+		}
+		for name, val := range rm.MessageAttributes {
+			if jm.MessageAttributes == nil {
+				jm.MessageAttributes = make(map[string]jsonMessageAttributeValue, len(rm.MessageAttributes))
+			}
+			jm.MessageAttributes[name] = jsonMessageAttributeValue{DataType: val.DataType, StringValue: val.StringValue}
+		}
+		messages = append(messages, jm)
+	}
+	awsutil.WriteJSON(w, http.StatusOK, map[string]any{"Messages": messages})
+}
+
+type deleteMessageJSONRequest struct {
+	QueueUrl      string `json:"QueueUrl"`
+	ReceiptHandle string `json:"ReceiptHandle"`
+}
+
+func (h *Handler) HandleDeleteMessageJSON(w http.ResponseWriter, r *http.Request) {
+	var req deleteMessageJSONRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "InvalidParameterValue", "malformed request body: "+err.Error())
+		return
+	}
+	queueName := queueNameFromURL(req.QueueUrl)
+	if queueName == "" || req.ReceiptHandle == "" {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "MissingParameter", "QueueUrl and ReceiptHandle are required")
+		return
+	}
+	if err := h.svc.DeleteMessage(queueName, req.ReceiptHandle); err != nil {
+		writeQueueErrorJSON(w, err)
+		return
+	}
+	awsutil.WriteJSON(w, http.StatusOK, map[string]string{})
+}
+
+type deleteQueueJSONRequest struct {
+	QueueUrl string `json:"QueueUrl"`
+}
+
+func (h *Handler) HandleDeleteQueueJSON(w http.ResponseWriter, r *http.Request) {
+	var req deleteQueueJSONRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "InvalidParameterValue", "malformed request body: "+err.Error())
+		return
+	}
+	queueName := queueNameFromURL(req.QueueUrl)
+	if queueName == "" {
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "MissingParameter", "QueueUrl is required")
+		return
+	}
+	if err := h.svc.DeleteQueue(queueName); err != nil {
+		writeQueueErrorJSON(w, err)
+		return
+	}
+	awsutil.WriteJSON(w, http.StatusOK, map[string]string{})
+}
+
+type listQueuesJSONRequest struct {
+	QueueNamePrefix string `json:"QueueNamePrefix"`
+}
+
+func (h *Handler) HandleListQueuesJSON(w http.ResponseWriter, r *http.Request) {
+	var req listQueuesJSONRequest
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			awsutil.WriteJSONError(w, http.StatusBadRequest, "InvalidParameterValue", "malformed request body: "+err.Error())
+			return
+		}
+	}
+	queues := h.svc.ListQueues(req.QueueNamePrefix)
+	urls := make([]string, 0, len(queues))
+	for _, q := range queues {
+		urls = append(urls, q.URL)
+	}
+	awsutil.WriteJSON(w, http.StatusOK, map[string][]string{"QueueUrls": urls})
+}
+
+// writeQueueErrorJSON maps a Service error to the matching AWS JSON
+// protocol error code/status, mirroring writeQueueError below.
+func writeQueueErrorJSON(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrQueueNotFound):
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "QueueDoesNotExist", err.Error())
+	case errors.Is(err, ErrMessageNotFound):
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "ReceiptHandleIsInvalid", err.Error())
+	case errors.Is(err, ErrQueueFull):
+		awsutil.WriteJSONError(w, http.StatusBadRequest, "OverLimit", err.Error())
+	default:
+		awsutil.WriteJSONError(w, http.StatusInternalServerError, "InternalError", err.Error())
+	}
 }
 
 // writeQueueError maps a Service error to the matching AWS error code/status.

@@ -28,6 +28,9 @@ go.work.sum
 .env
 *.local.md
 
+# Python virtualenv for scripts/
+.venv
+
 # Editor/IDE
 # .idea/
 # .vscode/
