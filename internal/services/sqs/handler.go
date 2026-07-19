@@ -250,6 +250,26 @@ type CancelMessageMoveTaskResponse struct {
 	Metadata awsutil.ResponseMetadata    `xml:"ResponseMetadata"`
 }
 
+type batchEntryJSON struct {
+	Id                string                               `json:"Id"`
+	ReceiptHandle     string                               `json:"ReceiptHandle,omitempty"`
+	VisibilityTimeout int                                  `json:"VisibilityTimeout,omitempty"`
+	MessageBody       string                               `json:"MessageBody,omitempty"`
+	MessageAttributes map[string]jsonMessageAttributeValue `json:"MessageAttributes,omitempty"`
+}
+
+type batchRequestJSON struct {
+	QueueUrl string           `json:"QueueUrl"`
+	Entries  []batchEntryJSON `json:"Entries"`
+}
+
+type batchResultErrorJSON struct {
+	Id          string `json:"Id"`
+	SenderFault bool   `json:"SenderFault"`
+	Code        string `json:"Code"`
+	Message     string `json:"Message,omitempty"`
+}
+
 // --- handlers ---
 
 func (h *Handler) HandleCreateQueue(w http.ResponseWriter, r *http.Request) {
@@ -946,29 +966,6 @@ func (h *Handler) HandleChangeMessageVisibilityJSON(w http.ResponseWriter, r *ht
 		return
 	}
 	awsutil.WriteJSON(w, http.StatusOK, map[string]string{})
-}
-
-// batchEntryJSON is a union of every field used across
-// ChangeMessageVisibilityBatch/DeleteMessageBatch/SendMessageBatch entries;
-// each action only reads the fields relevant to it.
-type batchEntryJSON struct {
-	Id                string                               `json:"Id"`
-	ReceiptHandle     string                               `json:"ReceiptHandle,omitempty"`
-	VisibilityTimeout int                                  `json:"VisibilityTimeout,omitempty"`
-	MessageBody       string                               `json:"MessageBody,omitempty"`
-	MessageAttributes map[string]jsonMessageAttributeValue `json:"MessageAttributes,omitempty"`
-}
-
-type batchRequestJSON struct {
-	QueueUrl string           `json:"QueueUrl"`
-	Entries  []batchEntryJSON `json:"Entries"`
-}
-
-type batchResultErrorJSON struct {
-	Id          string `json:"Id"`
-	SenderFault bool   `json:"SenderFault"`
-	Code        string `json:"Code"`
-	Message     string `json:"Message,omitempty"`
 }
 
 func idsToEntries(ids []string) []map[string]string {

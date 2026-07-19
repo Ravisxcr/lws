@@ -2,11 +2,12 @@
 // AnalyzeDocument APIs using real OpenCV (gocv) preprocessing and real
 // Tesseract (gosseract) OCR.
 //
-// FORMS and TABLES detection are heuristic approximations — spatial
-// proximity for key/value pairing, morphological line detection for table
-// grids — not an ML-grade layout model. The goal is to faithfully
-// reproduce the JSON Block-tree *shape* AWS SDKs expect, not pixel-perfect
-// parity with Textract's real accuracy.
+// FORMS and TABLES detection are heuristic approximations, not an ML-grade
+// layout model: TABLES uses morphological line detection to find table
+// grids, and FORMS anchors each key to a real detected underline/rule
+// first, falling back to spatial proximity when no drawn line is found.
+// The goal is to faithfully reproduce the JSON Block-tree *shape* AWS SDKs
+// expect, not pixel-perfect parity with Textract's real accuracy.
 package textract
 
 import (
@@ -48,8 +49,9 @@ type Point struct {
 }
 
 type Geometry struct {
-	BoundingBox BoundingBox `json:"BoundingBox"`
-	Polygon     []Point     `json:"Polygon"`
+	BoundingBox   BoundingBox `json:"BoundingBox"`
+	Polygon       []Point     `json:"Polygon"`
+	RotationAngle float64     `json:"RotationAngle"`
 }
 
 type Relationship struct {
@@ -97,14 +99,28 @@ type DocumentMetadata struct {
 	Pages int `json:"Pages"`
 }
 
+// Warning mirrors Textract's Warning shape, surfaced in async Get*
+// responses when a page couldn't be fully processed. This emulator never
+// produces partial failures, so callers always see an empty/omitted list.
+type Warning struct {
+	ErrorCode string `json:"ErrorCode"`
+	Pages     []int  `json:"Pages,omitempty"`
+}
+
+// modelVersion is a fixed placeholder for the *ModelVersion response
+// fields real Textract populates with its current model identifier.
+const modelVersion = "1.0"
+
 type DetectDocumentTextOutput struct {
-	DocumentMetadata DocumentMetadata `json:"DocumentMetadata"`
-	Blocks           []Block          `json:"Blocks"`
+	DocumentMetadata               DocumentMetadata `json:"DocumentMetadata"`
+	DetectDocumentTextModelVersion string           `json:"DetectDocumentTextModelVersion"`
+	Blocks                         []Block          `json:"Blocks"`
 }
 
 type AnalyzeDocumentOutput struct {
-	DocumentMetadata DocumentMetadata `json:"DocumentMetadata"`
-	Blocks           []Block          `json:"Blocks"`
+	DocumentMetadata            DocumentMetadata `json:"DocumentMetadata"`
+	AnalyzeDocumentModelVersion string           `json:"AnalyzeDocumentModelVersion"`
+	Blocks                      []Block          `json:"Blocks"`
 }
 
 // Processor turns raw document bytes into Textract-shaped Block trees. The
@@ -262,8 +278,9 @@ func (p *Processor) DetectDocumentText(raw []byte) (*DetectDocumentTextOutput, e
 	bin.Close()
 
 	return &DetectDocumentTextOutput{
-		DocumentMetadata: DocumentMetadata{Pages: 1},
-		Blocks:           b.blocks,
+		DocumentMetadata:               DocumentMetadata{Pages: 1},
+		DetectDocumentTextModelVersion: modelVersion,
+		Blocks:                         b.blocks,
 	}, nil
 }
 
@@ -300,13 +317,15 @@ func (p *Processor) AnalyzeDocument(raw []byte, featureTypes []string) (*Analyze
 		p.addTables(b, bin, tableRects, words)
 	}
 	if wantForms {
-		p.addKeyValueSets(b, lines, tableRects)
+		underlines := DetectFieldUnderlines(bin, tableRects)
+		p.addKeyValueSets(b, lines, tableRects, underlines)
 		p.addSelectionElements(b, bin, tableRects)
 	}
 
 	return &AnalyzeDocumentOutput{
-		DocumentMetadata: DocumentMetadata{Pages: 1},
-		Blocks:           b.blocks,
+		DocumentMetadata:            DocumentMetadata{Pages: 1},
+		AnalyzeDocumentModelVersion: modelVersion,
+		Blocks:                      b.blocks,
 	}, nil
 }
 
@@ -349,21 +368,44 @@ func (p *Processor) addTables(b *builder, bin *gocv.Mat, tables []image.Rectangl
 	}
 }
 
-// kvPair is a matched key/value line pair, as found by pairKeyValues.
-type kvPair struct {
-	Key   placedLine
-	Value placedLine
+// formValue is a form field's value: either an OCR line bound to a key —
+// via its underline anchor or, failing that, layout proximity — or, when a
+// detected underline has no OCR text over its writable area, an empty
+// value box. Real Textract emits a VALUE block even for a blank form
+// field, so an empty formValue still produces one.
+type formValue struct {
+	Box        image.Rectangle
+	Text       string
+	Confidence float64
+	WordIDs    []string
+	lineID     string // backing placedLine.ID, if any; claimed to prevent reuse.
 }
 
-// pairKeyValues pairs lines using simple layout heuristics: a line ending
-// in ':' (or short text, <=4 words) is treated as a KEY candidate; the
-// nearest unclaimed line to its right in the same horizontal band — or,
-// failing that, the nearest line directly below with a similar left edge —
-// is treated as its VALUE. Shared by the FORMS feature (addKeyValueSets)
-// and AnalyzeExpense, which both need the same key/value layout heuristic
-// but emit it in different output shapes.
-func pairKeyValues(lines []placedLine, tableRegions []image.Rectangle) []kvPair {
+// kvPair is a matched key/value pair, as found by pairKeyValues.
+type kvPair struct {
+	Key   placedLine
+	Value formValue
+}
+
+// pairKeyValues pairs lines into key/value fields. A line ending in ':'
+// (or short text, <=4 words) is treated as a KEY candidate. Its value is
+// found in two passes:
+//  1. Anchor to a real drawn underline/rule (the same morphological line
+//     detection TABLES uses): the nearest unclaimed underline to the
+//     key's right in the same horizontal band, or failing that, directly
+//     below with a similar left edge. Whatever OCR line overlaps the
+//     writable area just above that underline becomes the value; if none
+//     does, the field is still emitted with an empty value, matching a
+//     blank form field.
+//  2. Falling back to pure layout proximity (nearest unclaimed line to
+//     the right, then below) when no underline anchor was found.
+//
+// Shared by the FORMS feature (addKeyValueSets) and AnalyzeExpense, which
+// both need the same key/value layout heuristic but emit it in different
+// output shapes.
+func pairKeyValues(lines []placedLine, tableRegions []image.Rectangle, underlines []image.Rectangle) []kvPair {
 	claimed := make(map[string]bool, len(lines))
+	claimedUnderlines := make([]bool, len(underlines))
 
 	inTable := func(box image.Rectangle) bool {
 		for _, t := range tableRegions {
@@ -380,25 +422,114 @@ func pairKeyValues(lines []placedLine, tableRegions []image.Rectangle) []kvPair 
 			continue
 		}
 
-		value := findValueToRight(key, lines, claimed, inTable)
+		value := findValueViaUnderline(key, underlines, claimedUnderlines, lines, claimed, inTable)
 		if value == nil {
-			value = findValueBelow(key, lines, claimed, inTable)
+			if v := findValueToRight(key, lines, claimed, inTable); v != nil {
+				value = &formValue{Box: v.Box, Text: v.Text, Confidence: v.Confidence, WordIDs: v.WordIDs, lineID: v.ID}
+			}
+		}
+		if value == nil {
+			if v := findValueBelow(key, lines, claimed, inTable); v != nil {
+				value = &formValue{Box: v.Box, Text: v.Text, Confidence: v.Confidence, WordIDs: v.WordIDs, lineID: v.ID}
+			}
 		}
 		if value == nil {
 			continue
 		}
 
 		claimed[key.ID] = true
-		claimed[value.ID] = true
+		if value.lineID != "" {
+			claimed[value.lineID] = true
+		}
 		pairs = append(pairs, kvPair{Key: key, Value: *value})
 	}
 	return pairs
 }
 
+// findValueViaUnderline anchors key's value to the nearest unclaimed
+// detected underline (same search order as the proximity fallback: same
+// band to the right, else directly below with a similar left edge), then
+// binds whichever OCR line overlaps the writable area just above that
+// underline. Returns nil if no underline anchor is found at all — a
+// found-but-empty underline still yields a (blank) formValue, since the
+// underline itself is real CV signal that a field exists there.
+func findValueViaUnderline(key placedLine, underlines []image.Rectangle, claimedUnderlines []bool, lines []placedLine, claimedLines map[string]bool, inTable func(image.Rectangle) bool) *formValue {
+	idx := nearestUnderlineToRight(key, underlines, claimedUnderlines)
+	if idx < 0 {
+		idx = nearestUnderlineBelow(key, underlines, claimedUnderlines)
+	}
+	if idx < 0 {
+		return nil
+	}
+	claimedUnderlines[idx] = true
+	underline := underlines[idx]
+
+	lineHeight := key.Box.Dy()
+	writable := image.Rect(underline.Min.X, underline.Min.Y-lineHeight-2, underline.Max.X, underline.Min.Y+2)
+
+	for i := range lines {
+		candidate := lines[i]
+		if candidate.ID == key.ID || claimedLines[candidate.ID] || inTable(candidate.Box) {
+			continue
+		}
+		if candidate.Box.Overlaps(writable) {
+			return &formValue{Box: candidate.Box, Text: candidate.Text, Confidence: candidate.Confidence, WordIDs: candidate.WordIDs, lineID: candidate.ID}
+		}
+	}
+
+	return &formValue{Box: underline, Confidence: structuralConfidence}
+}
+
+// nearestUnclaimedUnderline shares the two underline-search passes needed
+// by findValueViaUnderline. within reports whether candidate underline u
+// lies in the direction/band expected relative to key.
+func nearestUnclaimedUnderline(key placedLine, underlines []image.Rectangle, claimed []bool, within func(u image.Rectangle) (ok bool, dist int)) int {
+	best := -1
+	bestDist := 0
+	for i, u := range underlines {
+		if claimed[i] {
+			continue
+		}
+		ok, dist := within(u)
+		if !ok {
+			continue
+		}
+		if best < 0 || dist < bestDist {
+			best, bestDist = i, dist
+		}
+	}
+	return best
+}
+
+// nearestUnderlineToRight finds the nearest unclaimed underline to the
+// right of key, within the same horizontal text band.
+func nearestUnderlineToRight(key placedLine, underlines []image.Rectangle, claimed []bool) int {
+	return nearestUnclaimedUnderline(key, underlines, claimed, func(u image.Rectangle) (bool, int) {
+		if u.Min.X <= key.Box.Max.X || !sameBand(key.Box, u) {
+			return false, 0
+		}
+		return true, u.Min.X - key.Box.Max.X
+	})
+}
+
+// nearestUnderlineBelow finds the nearest unclaimed underline directly
+// below key with a similar left edge.
+func nearestUnderlineBelow(key placedLine, underlines []image.Rectangle, claimed []bool) int {
+	return nearestUnclaimedUnderline(key, underlines, claimed, func(u image.Rectangle) (bool, int) {
+		if u.Min.Y <= key.Box.Max.Y || abs(u.Min.X-key.Box.Min.X) > 40 {
+			return false, 0
+		}
+		if dist := u.Min.Y - key.Box.Max.Y; dist <= key.Box.Dy()*4 {
+			return true, dist
+		}
+		return false, 0
+	})
+}
+
 // addKeyValueSets emits paired KEY_VALUE_SET blocks for each pairKeyValues
 // match, reusing the same WORD ids as the underlying LINE blocks.
-func (p *Processor) addKeyValueSets(b *builder, lines []placedLine, tableRegions []image.Rectangle) {
-	for _, pair := range pairKeyValues(lines, tableRegions) {
+func (p *Processor) addKeyValueSets(b *builder, lines []placedLine, tableRegions []image.Rectangle, underlines []image.Rectangle) {
+	for _, pair := range pairKeyValues(lines, tableRegions, underlines) {
 		valueID := b.add(Block{
 			BlockType:     "KEY_VALUE_SET",
 			Confidence:    structuralConfidence,

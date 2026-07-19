@@ -194,6 +194,39 @@ func DetectTableGrids(bin *gocv.Mat) []image.Rectangle {
 	return rects
 }
 
+// DetectFieldUnderlines finds drawn horizontal rules outside any detected
+// table — the underline/box edge a form places below or beside a label for
+// its value to be written on — using the same morphological line
+// extraction as DetectTableGrids, tuned to a shorter minimum run length so
+// a single field's underline (not just a full-width table rule) is
+// captured.
+func DetectFieldUnderlines(bin *gocv.Mat, exclude []image.Rectangle) []image.Rectangle {
+	inv := gocv.NewMat()
+	defer inv.Close()
+	gocv.BitwiseNot(*bin, &inv)
+
+	horizontal := extractLines(&inv, bin.Cols()/60, 1)
+	defer horizontal.Close()
+
+	contours := gocv.FindContours(horizontal, gocv.RetrievalExternal, gocv.ChainApproxSimple)
+	defer contours.Close()
+
+	var rects []image.Rectangle
+	for i := 0; i < contours.Size(); i++ {
+		rect := gocv.BoundingRect(contours.At(i))
+		if !looksLikeUnderline(rect) || overlapsAny(rect, exclude) {
+			continue
+		}
+		rects = append(rects, rect)
+	}
+	return rects
+}
+
+func looksLikeUnderline(r image.Rectangle) bool {
+	w, h := r.Dx(), r.Dy()
+	return h <= 6 && w >= 20
+}
+
 // extractLines isolates long straight lines from a binary (white-on-black)
 // image using an elongated structuring element of the given size.
 func extractLines(bin *gocv.Mat, kw, kh int) gocv.Mat {

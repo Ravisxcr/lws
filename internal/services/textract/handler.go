@@ -61,11 +61,24 @@ type getAsyncResultRequest struct {
 	JobId string `json:"JobId"`
 }
 
-type getAsyncResultResponse struct {
-	JobStatus        string           `json:"JobStatus"`
-	StatusMessage    string           `json:"StatusMessage,omitempty"`
-	DocumentMetadata DocumentMetadata `json:"DocumentMetadata"`
-	Blocks           []Block          `json:"Blocks,omitempty"`
+type getDocumentTextDetectionResponse struct {
+	JobStatus                      string           `json:"JobStatus"`
+	StatusMessage                  string           `json:"StatusMessage,omitempty"`
+	DocumentMetadata               DocumentMetadata `json:"DocumentMetadata"`
+	DetectDocumentTextModelVersion string           `json:"DetectDocumentTextModelVersion,omitempty"`
+	Blocks                         []Block          `json:"Blocks,omitempty"`
+	Warnings                       []Warning        `json:"Warnings,omitempty"`
+	NextToken                      string           `json:"NextToken,omitempty"`
+}
+
+type getDocumentAnalysisResponse struct {
+	JobStatus                   string           `json:"JobStatus"`
+	StatusMessage               string           `json:"StatusMessage,omitempty"`
+	DocumentMetadata            DocumentMetadata `json:"DocumentMetadata"`
+	AnalyzeDocumentModelVersion string           `json:"AnalyzeDocumentModelVersion,omitempty"`
+	Blocks                      []Block          `json:"Blocks,omitempty"`
+	Warnings                    []Warning        `json:"Warnings,omitempty"`
+	NextToken                   string           `json:"NextToken,omitempty"`
 }
 
 // Handler binds Textract's JSON-protocol HTTP requests to Processor calls.
@@ -171,7 +184,7 @@ func (h *Handler) HandleGetDocumentTextDetection(w http.ResponseWriter, r *http.
 		writeTextractError(w, err)
 		return
 	}
-	awsutil.WriteJSON(w, http.StatusOK, toGetAsyncResultResponse(job))
+	awsutil.WriteJSON(w, http.StatusOK, toGetDocumentTextDetectionResponse(job))
 }
 
 func (h *Handler) HandleStartDocumentAnalysis(w http.ResponseWriter, r *http.Request) {
@@ -205,7 +218,7 @@ func (h *Handler) HandleGetDocumentAnalysis(w http.ResponseWriter, r *http.Reque
 		writeTextractError(w, err)
 		return
 	}
-	awsutil.WriteJSON(w, http.StatusOK, toGetAsyncResultResponse(job))
+	awsutil.WriteJSON(w, http.StatusOK, toGetDocumentAnalysisResponse(job))
 }
 
 // requireS3Object validates that loc carries a usable S3Object, writing an
@@ -218,12 +231,23 @@ func (h *Handler) requireS3Object(w http.ResponseWriter, loc documentLocationInp
 	return loc.S3Object.Bucket, loc.S3Object.Name, true
 }
 
-func toGetAsyncResultResponse(job *AsyncJob) getAsyncResultResponse {
-	return getAsyncResultResponse{
-		JobStatus:        job.Status,
-		StatusMessage:    job.StatusMessage,
-		DocumentMetadata: job.DocumentMetadata,
-		Blocks:           job.Blocks,
+func toGetDocumentTextDetectionResponse(job *AsyncJob) getDocumentTextDetectionResponse {
+	return getDocumentTextDetectionResponse{
+		JobStatus:                      job.Status,
+		StatusMessage:                  job.StatusMessage,
+		DocumentMetadata:               job.DocumentMetadata,
+		DetectDocumentTextModelVersion: job.ModelVersion,
+		Blocks:                         job.Blocks,
+	}
+}
+
+func toGetDocumentAnalysisResponse(job *AsyncJob) getDocumentAnalysisResponse {
+	return getDocumentAnalysisResponse{
+		JobStatus:                   job.Status,
+		StatusMessage:               job.StatusMessage,
+		DocumentMetadata:            job.DocumentMetadata,
+		AnalyzeDocumentModelVersion: job.ModelVersion,
+		Blocks:                      job.Blocks,
 	}
 }
 

@@ -20,7 +20,6 @@ type Server struct {
 }
 
 // NewServer wires up the service engine and router, and returns a Server
-// ready to Start on the given port.
 func NewServer(port string) *Server {
 	engine := services.NewEngine()
 	handler := router.NewRouter(engine)
@@ -31,19 +30,12 @@ func NewServer(port string) *Server {
 			Handler:     handler,
 			ReadTimeout: 30 * time.Second,
 			IdleTimeout: 120 * time.Second,
-			// WriteTimeout is intentionally left unset: real Textract OCR
-			// (gocv preprocessing + gosseract) on larger images can take
-			// several seconds, and a tight WriteTimeout would truncate
-			// legitimate slow responses.
 		},
 		engine: engine,
 	}
 }
 
-// Start begins serving requests and blocks until the server stops. A clean
-// shutdown via Stop() surfaces as http.ErrServerClosed, which is not a
-// failure and must be swallowed here — callers (main.go) treat any non-nil
-// error from Start as fatal.
+// Start begins serving requests and blocks until the server stops.
 func (s *Server) Start() error {
 	log.Printf("lws: listening on %s", s.httpServer.Addr)
 	if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

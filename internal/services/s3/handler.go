@@ -15,119 +15,10 @@ import (
 	"lws/pkg/awsutil"
 )
 
-// Handler binds S3's REST HTTP requests (bucket/key in the URL path, verb
-// plus query-string subresources selecting the operation) to Service
-// calls, and implements http.Handler directly since — unlike SQS/SNS/
-// Textract's single Action/Target dispatch — S3 routes on method+path.
+// Handler binds S3's REST HTTP requests (bucket/key in the URL path
 type Handler struct {
 	svc *Service
 }
-
-// NewHandler returns an S3 HTTP handler backed by svc.
-func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
-}
-
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	if path == "" {
-		if r.Method == http.MethodGet {
-			h.handleListBuckets(w, r)
-			return
-		}
-		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method for the root path", "")
-		return
-	}
-
-	bucket, key, hasKey := strings.Cut(path, "/")
-	if !hasKey || key == "" {
-		h.routeBucket(w, r, bucket)
-		return
-	}
-	h.routeObject(w, r, bucket, key)
-}
-
-func (h *Handler) routeBucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	q := r.URL.Query()
-	switch r.Method {
-	case http.MethodPut:
-		h.handleCreateBucket(w, r, bucket)
-	case http.MethodDelete:
-		h.handleDeleteBucket(w, r, bucket)
-	case http.MethodHead:
-		h.handleHeadBucket(w, r, bucket)
-	case http.MethodGet:
-		switch {
-		case q.Has("location"):
-			h.handleGetBucketLocation(w, r, bucket)
-		case q.Has("uploads"):
-			h.handleListMultipartUploads(w, r, bucket)
-		case q.Get("list-type") == "2":
-			h.handleListObjectsV2(w, r, bucket)
-		default:
-			h.handleListObjects(w, r, bucket)
-		}
-	case http.MethodPost:
-		if q.Has("delete") {
-			h.handleDeleteObjects(w, r, bucket)
-			return
-		}
-		writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "unsupported bucket POST request", bucket)
-	default:
-		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method for a bucket path", bucket)
-	}
-}
-
-func (h *Handler) routeObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	q := r.URL.Query()
-	resource := bucket + "/" + key
-	switch r.Method {
-	case http.MethodPut:
-		switch {
-		case q.Has("partNumber") && q.Has("uploadId"):
-			h.handleUploadPart(w, r, bucket, key)
-		case q.Has("tagging"):
-			h.handlePutObjectTagging(w, r, bucket, key)
-		case r.Header.Get("X-Amz-Copy-Source") != "":
-			h.handleCopyObject(w, r, bucket, key)
-		default:
-			h.handlePutObject(w, r, bucket, key)
-		}
-	case http.MethodGet:
-		switch {
-		case q.Has("uploadId"):
-			h.handleListParts(w, r, bucket, key)
-		case q.Has("tagging"):
-			h.handleGetObjectTagging(w, r, bucket, key)
-		default:
-			h.handleGetObject(w, r, bucket, key)
-		}
-	case http.MethodHead:
-		h.handleHeadObject(w, r, bucket, key)
-	case http.MethodDelete:
-		switch {
-		case q.Has("uploadId"):
-			h.handleAbortMultipartUpload(w, r, bucket, key)
-		case q.Has("tagging"):
-			h.handleDeleteObjectTagging(w, r, bucket, key)
-		default:
-			h.handleDeleteObject(w, r, bucket, key)
-		}
-	case http.MethodPost:
-		switch {
-		case q.Has("uploads"):
-			h.handleCreateMultipartUpload(w, r, bucket, key)
-		case q.Has("uploadId"):
-			h.handleCompleteMultipartUpload(w, r, bucket, key)
-		default:
-			writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "unsupported object POST request", resource)
-		}
-	default:
-		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method for an object path", resource)
-	}
-}
-
-// --- XML response/request shapes, matching real S3's REST responses ---
 
 const s3Namespace = "http://s3.amazonaws.com/doc/2006-03-01/"
 
@@ -269,6 +160,110 @@ type listMultipartUploadsResult struct {
 	XMLName xml.Name    `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListMultipartUploadsResult"`
 	Bucket  string      `xml:"Bucket"`
 	Upload  []uploadXML `xml:"Upload,omitempty"`
+}
+
+// NewHandler returns an S3 HTTP handler backed by svc.
+func NewHandler(svc *Service) *Handler {
+	return &Handler{svc: svc}
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path == "" {
+		if r.Method == http.MethodGet {
+			h.handleListBuckets(w, r)
+			return
+		}
+		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method for the root path", "")
+		return
+	}
+
+	bucket, key, hasKey := strings.Cut(path, "/")
+	if !hasKey || key == "" {
+		h.routeBucket(w, r, bucket)
+		return
+	}
+	h.routeObject(w, r, bucket, key)
+}
+
+func (h *Handler) routeBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	q := r.URL.Query()
+	switch r.Method {
+	case http.MethodPut:
+		h.handleCreateBucket(w, r, bucket)
+	case http.MethodDelete:
+		h.handleDeleteBucket(w, r, bucket)
+	case http.MethodHead:
+		h.handleHeadBucket(w, r, bucket)
+	case http.MethodGet:
+		switch {
+		case q.Has("location"):
+			h.handleGetBucketLocation(w, r, bucket)
+		case q.Has("uploads"):
+			h.handleListMultipartUploads(w, r, bucket)
+		case q.Get("list-type") == "2":
+			h.handleListObjectsV2(w, r, bucket)
+		default:
+			h.handleListObjects(w, r, bucket)
+		}
+	case http.MethodPost:
+		if q.Has("delete") {
+			h.handleDeleteObjects(w, r, bucket)
+			return
+		}
+		writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "unsupported bucket POST request", bucket)
+	default:
+		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method for a bucket path", bucket)
+	}
+}
+
+func (h *Handler) routeObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	q := r.URL.Query()
+	resource := bucket + "/" + key
+	switch r.Method {
+	case http.MethodPut:
+		switch {
+		case q.Has("partNumber") && q.Has("uploadId"):
+			h.handleUploadPart(w, r, bucket, key)
+		case q.Has("tagging"):
+			h.handlePutObjectTagging(w, r, bucket, key)
+		case r.Header.Get("X-Amz-Copy-Source") != "":
+			h.handleCopyObject(w, r, bucket, key)
+		default:
+			h.handlePutObject(w, r, bucket, key)
+		}
+	case http.MethodGet:
+		switch {
+		case q.Has("uploadId"):
+			h.handleListParts(w, r, bucket, key)
+		case q.Has("tagging"):
+			h.handleGetObjectTagging(w, r, bucket, key)
+		default:
+			h.handleGetObject(w, r, bucket, key)
+		}
+	case http.MethodHead:
+		h.handleHeadObject(w, r, bucket, key)
+	case http.MethodDelete:
+		switch {
+		case q.Has("uploadId"):
+			h.handleAbortMultipartUpload(w, r, bucket, key)
+		case q.Has("tagging"):
+			h.handleDeleteObjectTagging(w, r, bucket, key)
+		default:
+			h.handleDeleteObject(w, r, bucket, key)
+		}
+	case http.MethodPost:
+		switch {
+		case q.Has("uploads"):
+			h.handleCreateMultipartUpload(w, r, bucket, key)
+		case q.Has("uploadId"):
+			h.handleCompleteMultipartUpload(w, r, bucket, key)
+		default:
+			writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "unsupported object POST request", resource)
+		}
+	default:
+		writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method for an object path", resource)
+	}
 }
 
 // --- bucket handlers ---
@@ -667,9 +662,6 @@ func extractUserMetadata(header http.Header) map[string]string {
 }
 
 // parseRange parses a single-range "bytes=start-end" Range header (including
-// the open-ended "start-" and suffix "-N" forms). ok is false if the header
-// is absent, malformed, or unsatisfiable, in which case callers should fall
-// back to serving the full object.
 func parseRange(header string, size int) (start, end int, ok bool) {
 	header = strings.TrimPrefix(header, "bytes=")
 	before, after, found := strings.Cut(header, "-")

@@ -23,9 +23,16 @@ type DocumentStore interface {
 	GetObject(bucket, key string) (*s3.Object, error)
 }
 
+// JobStatus values mirror Textract's documented JobStatus enum
+// (IN_PROGRESS | SUCCEEDED | FAILED | PARTIAL_SUCCESS). This emulator has no
+// worker pool and no per-page failure model, so a job only ever settles as
+// JobStatusSucceeded or JobStatusFailed; IN_PROGRESS/PARTIAL_SUCCESS are
+// declared for shape parity but never produced.
 const (
-	JobStatusSucceeded = "SUCCEEDED"
-	JobStatusFailed    = "FAILED"
+	JobStatusInProgress     = "IN_PROGRESS"
+	JobStatusSucceeded      = "SUCCEEDED"
+	JobStatusFailed         = "FAILED"
+	JobStatusPartialSuccess = "PARTIAL_SUCCESS"
 )
 
 // ErrJobNotFound mirrors Textract's InvalidJobIdException.
@@ -41,6 +48,7 @@ type AsyncJob struct {
 	StatusMessage    string
 	DocumentMetadata DocumentMetadata
 	Blocks           []Block
+	ModelVersion     string
 }
 
 // jobStore is the thread-safe registry of async jobs, keyed by JobId.
@@ -97,6 +105,7 @@ func (p *Processor) StartDocumentTextDetection(store DocumentStore, bucket, key 
 		job.Status = JobStatusSucceeded
 		job.DocumentMetadata = out.DocumentMetadata
 		job.Blocks = out.Blocks
+		job.ModelVersion = out.DetectDocumentTextModelVersion
 	}
 	return p.jobs.put(job), nil
 }
@@ -135,6 +144,7 @@ func (p *Processor) StartDocumentAnalysis(store DocumentStore, bucket, key strin
 		job.Status = JobStatusSucceeded
 		job.DocumentMetadata = out.DocumentMetadata
 		job.Blocks = out.Blocks
+		job.ModelVersion = out.AnalyzeDocumentModelVersion
 	}
 	return p.jobs.put(job), nil
 }

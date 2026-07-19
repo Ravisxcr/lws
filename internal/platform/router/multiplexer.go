@@ -1,11 +1,5 @@
 // Package router sniffs incoming AWS-style requests and dispatches them to
-// the correct service handler. Three wire protocols are supported on the
-// same port: the JSON protocol (Textract-style, identified by the
-// X-Amz-Target header), the Query protocol (SQS/SNS-style, form-encoded
-// with an Action parameter), and the REST protocol (S3-style, with no
-// Action/Target and the operation instead selected by HTTP method, URL
-// path, and query-string subresources), which is tried as a fallback once
-// neither of the other two match.
+// the correct service handler.
 package router
 
 import (
@@ -14,9 +8,7 @@ import (
 	"lws/pkg/awsutil"
 )
 
-// Multiplexer dispatches requests by protocol: X-Amz-Target header for the
-// JSON protocol, form-encoded Action for the Query protocol, and a REST
-// fallback handler for everything else.
+
 type Multiplexer struct {
 	jsonRoutes   map[string]http.HandlerFunc
 	queryRoutes  map[string]http.HandlerFunc
@@ -32,20 +24,16 @@ func NewMultiplexer() *Multiplexer {
 }
 
 // RegisterJSONAction registers a handler for a JSON-protocol operation,
-// keyed by the exact X-Amz-Target value (e.g. "Textract.DetectDocumentText").
 func (m *Multiplexer) RegisterJSONAction(target string, h http.HandlerFunc) {
 	m.jsonRoutes[target] = h
 }
 
 // RegisterQueryAction registers a handler for a Query-protocol action
-// (e.g. "SendMessage", "Publish").
 func (m *Multiplexer) RegisterQueryAction(action string, h http.HandlerFunc) {
 	m.queryRoutes[action] = h
 }
 
 // RegisterRESTFallback registers the handler for REST-protocol services
-// (currently S3), tried once a request carries neither an X-Amz-Target
-// header nor a Query-protocol Action parameter.
 func (m *Multiplexer) RegisterRESTFallback(h http.Handler) {
 	m.restFallback = h
 }

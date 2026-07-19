@@ -49,9 +49,10 @@ func (p *Processor) AnalyzeExpense(raw []byte) (*AnalyzeExpenseOutput, error) {
 	defer bin.Close()
 
 	tableRects := DetectTableGrids(bin)
+	underlines := DetectFieldUnderlines(bin, tableRects)
 
 	var fields []ExpenseField
-	for _, pair := range pairKeyValues(lines, tableRects) {
+	for _, pair := range pairKeyValues(lines, tableRects, underlines) {
 		labelText := strings.TrimSuffix(strings.TrimSpace(pair.Key.Text), ":")
 		fields = append(fields, ExpenseField{
 			Type: ExpenseType{Text: expenseTypeFromLabel(labelText), Confidence: structuralConfidence},
