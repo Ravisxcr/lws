@@ -1,0 +1,9 @@
+services:
+  emulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - PORT=4566
+    ports:
+      - "4566:4566"
