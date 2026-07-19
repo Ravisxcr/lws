@@ -34,11 +34,11 @@ func NewEngine() *Engine {
 	snsSvc := sns.NewService(sqsSvc) // *sqs.Service satisfies sns.QueuePublisher
 	snsHandler := sns.NewHandler(snsSvc)
 
-	textractProc := textract.NewProcessor()
-	textractHandler := textract.NewHandler(textractProc)
-
 	s3Svc := s3.NewService()
 	s3Handler := s3.NewHandler(s3Svc)
+
+	textractProc := textract.NewProcessor()
+	textractHandler := textract.NewHandler(textractProc, s3Svc) // *s3.Service satisfies textract.DocumentStore
 
 	return &Engine{
 		SQSService: sqsSvc,

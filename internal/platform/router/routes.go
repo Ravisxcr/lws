@@ -14,6 +14,11 @@ func NewRouter(eng *services.Engine) http.Handler {
 	// Textract (JSON protocol)
 	mux.RegisterJSONAction("Textract.DetectDocumentText", eng.TextractHandler.HandleDetectDocumentText)
 	mux.RegisterJSONAction("Textract.AnalyzeDocument", eng.TextractHandler.HandleAnalyzeDocument)
+	mux.RegisterJSONAction("Textract.AnalyzeExpense", eng.TextractHandler.HandleAnalyzeExpense)
+	mux.RegisterJSONAction("Textract.StartDocumentTextDetection", eng.TextractHandler.HandleStartDocumentTextDetection)
+	mux.RegisterJSONAction("Textract.GetDocumentTextDetection", eng.TextractHandler.HandleGetDocumentTextDetection)
+	mux.RegisterJSONAction("Textract.StartDocumentAnalysis", eng.TextractHandler.HandleStartDocumentAnalysis)
+	mux.RegisterJSONAction("Textract.GetDocumentAnalysis", eng.TextractHandler.HandleGetDocumentAnalysis)
 
 	// SQS (Query protocol)
 	mux.RegisterQueryAction("CreateQueue", eng.SQSHandler.HandleCreateQueue)

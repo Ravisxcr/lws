@@ -10,6 +10,7 @@
 package textract
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -73,6 +74,25 @@ type Block struct {
 	Page            int            `json:"Page"`
 }
 
+// MarshalJSON emits Text (even when empty) for WORD/LINE blocks — the only
+// types real Textract populates it for — and omits it entirely for every
+// other BlockType, matching AWS's shape exactly. A plain `omitempty` tag on
+// Text can't express this: it would drop Text for a WORD/LINE with no
+// recognized characters too, which broke SDK code that indexes resp["Text"]
+// unconditionally on every LINE block.
+func (b Block) MarshalJSON() ([]byte, error) {
+	type alias Block
+	out := struct {
+		alias
+		Text *string `json:"Text,omitempty"`
+	}{alias: alias(b)}
+	if b.BlockType == "WORD" || b.BlockType == "LINE" {
+		text := b.Text
+		out.Text = &text
+	}
+	return json.Marshal(out)
+}
+
 type DocumentMetadata struct {
 	Pages int `json:"Pages"`
 }
@@ -87,12 +107,16 @@ type AnalyzeDocumentOutput struct {
 	Blocks           []Block          `json:"Blocks"`
 }
 
-// Processor turns raw document bytes into Textract-shaped Block trees.
-type Processor struct{}
+// Processor turns raw document bytes into Textract-shaped Block trees. The
+// only state it carries is the in-memory async job store used by
+// StartDocumentTextDetection/StartDocumentAnalysis.
+type Processor struct {
+	jobs *jobStore
+}
 
-// NewProcessor returns a stateless Textract processor.
+// NewProcessor returns a Textract processor with an empty async job store.
 func NewProcessor() *Processor {
-	return &Processor{}
+	return &Processor{jobs: newJobStore()}
 }
 
 // --- block-tree builder ---
@@ -147,10 +171,11 @@ type placedWord struct {
 }
 
 type placedLine struct {
-	ID      string
-	Box     image.Rectangle
-	Text    string
-	WordIDs []string
+	ID         string
+	Box        image.Rectangle
+	Text       string
+	Confidence float64
+	WordIDs    []string
 }
 
 // buildTextBlocks runs the shared pipeline (decode -> preprocess ->
@@ -210,7 +235,7 @@ func (p *Processor) buildTextBlocks(raw []byte) (*builder, []placedLine, []place
 		}
 		lid := b.add(lineBlock)
 		lineIDs = append(lineIDs, lid)
-		lines = append(lines, placedLine{ID: lid, Box: line.Box, Text: line.Text, WordIDs: wordIDs})
+		lines = append(lines, placedLine{ID: lid, Box: line.Box, Text: line.Text, Confidence: line.Confidence, WordIDs: wordIDs})
 	}
 
 	pageBlock := Block{
@@ -324,13 +349,20 @@ func (p *Processor) addTables(b *builder, bin *gocv.Mat, tables []image.Rectangl
 	}
 }
 
-// addKeyValueSets pairs lines using simple layout heuristics: a line
-// ending in ':' (or short text, <=4 words) is treated as a KEY candidate;
-// the nearest unclaimed line to its right in the same horizontal band —
-// or, failing that, the nearest line directly below with a similar left
-// edge — is treated as its VALUE. Emits paired KEY_VALUE_SET blocks that
-// reuse the same WORD ids as the underlying LINE blocks.
-func (p *Processor) addKeyValueSets(b *builder, lines []placedLine, tableRegions []image.Rectangle) {
+// kvPair is a matched key/value line pair, as found by pairKeyValues.
+type kvPair struct {
+	Key   placedLine
+	Value placedLine
+}
+
+// pairKeyValues pairs lines using simple layout heuristics: a line ending
+// in ':' (or short text, <=4 words) is treated as a KEY candidate; the
+// nearest unclaimed line to its right in the same horizontal band — or,
+// failing that, the nearest line directly below with a similar left edge —
+// is treated as its VALUE. Shared by the FORMS feature (addKeyValueSets)
+// and AnalyzeExpense, which both need the same key/value layout heuristic
+// but emit it in different output shapes.
+func pairKeyValues(lines []placedLine, tableRegions []image.Rectangle) []kvPair {
 	claimed := make(map[string]bool, len(lines))
 
 	inTable := func(box image.Rectangle) bool {
@@ -342,6 +374,7 @@ func (p *Processor) addKeyValueSets(b *builder, lines []placedLine, tableRegions
 		return false
 	}
 
+	var pairs []kvPair
 	for _, key := range lines {
 		if claimed[key.ID] || inTable(key.Box) || !looksLikeKey(key.Text) {
 			continue
@@ -357,18 +390,26 @@ func (p *Processor) addKeyValueSets(b *builder, lines []placedLine, tableRegions
 
 		claimed[key.ID] = true
 		claimed[value.ID] = true
+		pairs = append(pairs, kvPair{Key: key, Value: *value})
+	}
+	return pairs
+}
 
+// addKeyValueSets emits paired KEY_VALUE_SET blocks for each pairKeyValues
+// match, reusing the same WORD ids as the underlying LINE blocks.
+func (p *Processor) addKeyValueSets(b *builder, lines []placedLine, tableRegions []image.Rectangle) {
+	for _, pair := range pairKeyValues(lines, tableRegions) {
 		valueID := b.add(Block{
 			BlockType:     "KEY_VALUE_SET",
 			Confidence:    structuralConfidence,
 			EntityTypes:   []string{"VALUE"},
-			Geometry:      b.geometry(value.Box),
-			Relationships: relIfAny("CHILD", value.WordIDs),
+			Geometry:      b.geometry(pair.Value.Box),
+			Relationships: relIfAny("CHILD", pair.Value.WordIDs),
 		})
 
 		var keyRels []Relationship
-		if len(key.WordIDs) > 0 {
-			keyRels = append(keyRels, Relationship{Type: "CHILD", Ids: key.WordIDs})
+		if len(pair.Key.WordIDs) > 0 {
+			keyRels = append(keyRels, Relationship{Type: "CHILD", Ids: pair.Key.WordIDs})
 		}
 		keyRels = append(keyRels, Relationship{Type: "VALUE", Ids: []string{valueID}})
 
@@ -376,7 +417,7 @@ func (p *Processor) addKeyValueSets(b *builder, lines []placedLine, tableRegions
 			BlockType:     "KEY_VALUE_SET",
 			Confidence:    structuralConfidence,
 			EntityTypes:   []string{"KEY"},
-			Geometry:      b.geometry(key.Box),
+			Geometry:      b.geometry(pair.Key.Box),
 			Relationships: keyRels,
 		})
 	}
