@@ -4,6 +4,7 @@
 package sqs
 
 import (
+	"encoding/json"
 	"sort"
 	"strconv"
 	"sync"
@@ -42,14 +43,32 @@ type inFlightRecord struct {
 	timer *time.Timer
 }
 
-// Queue is a single SQS queue: an immutable identity (Name/URL/Arn/
-// Attributes) plus the mutable concurrency-protected state backing message
-// delivery.
+// redrivePolicy mirrors the JSON shape SQS stores in a queue's
+// RedrivePolicy attribute.
+type redrivePolicy struct {
+	DeadLetterTargetArn string `json:"deadLetterTargetArn"`
+	MaxReceiveCount     int    `json:"maxReceiveCount"`
+}
+
+// Queue is a single SQS queue: an immutable identity (Name/URL/Arn) plus the
+// mutable concurrency-protected state backing message delivery, attributes,
+// and tags.
 type Queue struct {
-	Name       string
-	URL        string
-	Arn        string
+	Name string
+	URL  string
+	Arn  string
+
+	CreatedTimestamp      time.Time
+	LastModifiedTimestamp time.Time
+
+	attrMu     sync.RWMutex
 	Attributes map[string]string
+	Tags       map[string]string
+	// permissions maps a policy Label to the account IDs it grants access
+	// to. The emulator has no IAM, so these are stored purely for API
+	// compatibility (AddPermission/RemovePermission/round-trip) and never
+	// enforced.
+	permissions map[string]bool
 
 	ready chan *Message
 
@@ -60,12 +79,121 @@ type Queue struct {
 // VisibilityTimeout returns the queue's configured visibility timeout, or
 // the AWS default of 30s if unset/invalid.
 func (q *Queue) VisibilityTimeout() time.Duration {
+	q.attrMu.RLock()
+	defer q.attrMu.RUnlock()
 	if v, ok := q.Attributes["VisibilityTimeout"]; ok {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
 			return time.Duration(secs) * time.Second
 		}
 	}
 	return defaultVisibilityTimeout
+}
+
+// redrivePolicy returns the queue's parsed RedrivePolicy attribute, if any
+// is set and well-formed.
+func (q *Queue) redrivePolicy() (redrivePolicy, bool) {
+	q.attrMu.RLock()
+	raw, ok := q.Attributes["RedrivePolicy"]
+	q.attrMu.RUnlock()
+	if !ok || raw == "" {
+		return redrivePolicy{}, false
+	}
+	var rp redrivePolicy
+	if err := json.Unmarshal([]byte(raw), &rp); err != nil || rp.DeadLetterTargetArn == "" {
+		return redrivePolicy{}, false
+	}
+	return rp, true
+}
+
+// GetAttributes returns a copy of the queue's mutable attributes, safe for
+// the caller to read without further locking.
+func (q *Queue) GetAttributes() map[string]string {
+	q.attrMu.RLock()
+	defer q.attrMu.RUnlock()
+	out := make(map[string]string, len(q.Attributes))
+	for k, v := range q.Attributes {
+		out[k] = v
+	}
+	return out
+}
+
+// SetAttributes merges attrs into the queue's attributes and bumps
+// LastModifiedTimestamp.
+func (q *Queue) SetAttributes(attrs map[string]string) {
+	q.attrMu.Lock()
+	defer q.attrMu.Unlock()
+	if q.Attributes == nil {
+		q.Attributes = make(map[string]string, len(attrs))
+	}
+	for k, v := range attrs {
+		q.Attributes[k] = v
+	}
+	q.LastModifiedTimestamp = time.Now()
+}
+
+// GetTags returns a copy of the queue's tags.
+func (q *Queue) GetTags() map[string]string {
+	q.attrMu.RLock()
+	defer q.attrMu.RUnlock()
+	out := make(map[string]string, len(q.Tags))
+	for k, v := range q.Tags {
+		out[k] = v
+	}
+	return out
+}
+
+// SetTags merges tags into the queue's tag set.
+func (q *Queue) SetTags(tags map[string]string) {
+	q.attrMu.Lock()
+	defer q.attrMu.Unlock()
+	if q.Tags == nil {
+		q.Tags = make(map[string]string, len(tags))
+	}
+	for k, v := range tags {
+		q.Tags[k] = v
+	}
+}
+
+// UntagKeys removes the given tag keys from the queue's tag set.
+func (q *Queue) UntagKeys(keys []string) {
+	q.attrMu.Lock()
+	defer q.attrMu.Unlock()
+	for _, k := range keys {
+		delete(q.Tags, k)
+	}
+}
+
+// AddPermission records a policy label as granted, for API round-trip only.
+func (q *Queue) AddPermission(label string) {
+	q.attrMu.Lock()
+	defer q.attrMu.Unlock()
+	if q.permissions == nil {
+		q.permissions = make(map[string]bool)
+	}
+	q.permissions[label] = true
+}
+
+// RemovePermission removes a previously-added policy label, reporting
+// whether it existed.
+func (q *Queue) RemovePermission(label string) bool {
+	q.attrMu.Lock()
+	defer q.attrMu.Unlock()
+	_, ok := q.permissions[label]
+	delete(q.permissions, label)
+	return ok
+}
+
+// ReadyCount returns how many messages are currently ready for delivery.
+func (q *Queue) ReadyCount() int {
+	return len(q.ready)
+}
+
+// InFlightCount returns how many messages are currently received but not
+// yet deleted or expired.
+func (q *Queue) InFlightCount() int {
+	q.inFlightMu.Lock()
+	defer q.inFlightMu.Unlock()
+	return len(q.inFlight)
 }
 
 // stopAllTimers cancels every pending redelivery timer. Called when the
@@ -79,15 +207,34 @@ func (q *Queue) stopAllTimers() {
 	}
 }
 
+// MoveTask tracks a StartMessageMoveTask request. The emulator performs the
+// move synchronously (there's no background worker pool to speak of), so a
+// task is always COMPLETED by the time StartMessageMoveTask returns.
+type MoveTask struct {
+	TaskHandle                       string
+	SourceArn                        string
+	DestinationArn                   string
+	Status                           string // RUNNING, COMPLETED, CANCELLED, FAILED
+	ApproximateNumberOfMessagesMoved int64
+	StartedTimestamp                 int64
+	FailureReason                    string
+}
+
 // Storage is the thread-safe registry of all queues, keyed by queue name.
 type Storage struct {
 	mu     sync.RWMutex
 	queues map[string]*Queue
+
+	tasksMu sync.Mutex
+	tasks   map[string]*MoveTask
 }
 
 // NewStorage returns an empty queue registry.
 func NewStorage() *Storage {
-	return &Storage{queues: make(map[string]*Queue)}
+	return &Storage{
+		queues: make(map[string]*Queue),
+		tasks:  make(map[string]*MoveTask),
+	}
 }
 
 // Create registers a new queue, or returns the existing one if a queue by
@@ -99,13 +246,16 @@ func (s *Storage) Create(name, url, arn string, attrs map[string]string) (q *Que
 	if existing, ok := s.queues[name]; ok {
 		return existing, false
 	}
+	now := time.Now()
 	q = &Queue{
-		Name:       name,
-		URL:        url,
-		Arn:        arn,
-		Attributes: attrs,
-		ready:      make(chan *Message, queueCapacity),
-		inFlight:   make(map[string]*inFlightRecord),
+		Name:                  name,
+		URL:                   url,
+		Arn:                   arn,
+		CreatedTimestamp:      now,
+		LastModifiedTimestamp: now,
+		Attributes:            attrs,
+		ready:                 make(chan *Message, queueCapacity),
+		inFlight:              make(map[string]*inFlightRecord),
 	}
 	s.queues[name] = q
 	return q, true
@@ -117,6 +267,18 @@ func (s *Storage) Get(name string) (*Queue, bool) {
 	defer s.mu.RUnlock()
 	q, ok := s.queues[name]
 	return q, ok
+}
+
+// GetByArn looks up a queue by its ARN.
+func (s *Storage) GetByArn(arn string) (*Queue, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, q := range s.queues {
+		if q.Arn == arn {
+			return q, true
+		}
+	}
+	return nil, false
 }
 
 // Delete removes a queue, stopping any pending redelivery timers.
@@ -142,5 +304,49 @@ func (s *Storage) List() []*Queue {
 		out = append(out, q)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// DeadLetterSources returns every queue whose RedrivePolicy targets dlqArn.
+func (s *Storage) DeadLetterSources(dlqArn string) []*Queue {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*Queue
+	for _, q := range s.queues {
+		if rp, ok := q.redrivePolicy(); ok && rp.DeadLetterTargetArn == dlqArn {
+			out = append(out, q)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// SaveTask registers a move task.
+func (s *Storage) SaveTask(t *MoveTask) {
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+	s.tasks[t.TaskHandle] = t
+}
+
+// GetTask looks up a move task by handle.
+func (s *Storage) GetTask(handle string) (*MoveTask, bool) {
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+	t, ok := s.tasks[handle]
+	return t, ok
+}
+
+// TasksForSource returns every move task started for the given source ARN,
+// most recently started first.
+func (s *Storage) TasksForSource(sourceArn string) []*MoveTask {
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+	var out []*MoveTask
+	for _, t := range s.tasks {
+		if t.SourceArn == sourceArn {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedTimestamp > out[j].StartedTimestamp })
 	return out
 }

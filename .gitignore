@@ -28,8 +28,10 @@ go.work.sum
 .env
 *.local.md
 
-# Python virtualenv for scripts/
+# Python virtualenv for tests/
 .venv
+__pycache__/
+.pytest_cache/
 
 # Editor/IDE
 # .idea/

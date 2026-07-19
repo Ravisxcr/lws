@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -153,4 +154,91 @@ func ParseAttributePairs(form url.Values, prefix string) map[string]string {
 		}
 	}
 	return result
+}
+
+// ParseIndexedEntries scans form for "<prefix>.N.<field>" parameters,
+// grouping them by N, for AWS's Query-protocol batch-request member list
+// convention (e.g. SendMessageBatchRequestEntry.1.Id,
+// SendMessageBatchRequestEntry.1.MessageBody).
+func ParseIndexedEntries(form url.Values, prefix string) map[string]map[string]string {
+	out := map[string]map[string]string{}
+	p := prefix + "."
+	for key, vals := range form {
+		if len(vals) == 0 {
+			continue
+		}
+		rest, ok := strings.CutPrefix(key, p)
+		if !ok {
+			continue
+		}
+		idx, field, ok := strings.Cut(rest, ".")
+		if !ok {
+			continue
+		}
+		if out[idx] == nil {
+			out[idx] = map[string]string{}
+		}
+		out[idx][field] = vals[0]
+	}
+	return out
+}
+
+// SortedIndexKeys returns m's keys in ascending numeric order, so batch
+// entries are processed in the order the caller listed them.
+func SortedIndexKeys(m map[string]map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, _ := strconv.Atoi(keys[i])
+		b, _ := strconv.Atoi(keys[j])
+		return a < b
+	})
+	return keys
+}
+
+// IndexedValues scans form for "<prefix>.N" parameters (e.g.
+// AttributeName.1, AttributeName.2) and returns their values ordered by N.
+func IndexedValues(form url.Values, prefix string) []string {
+	type kv struct {
+		idx int
+		val string
+	}
+	var items []kv
+	p := prefix + "."
+	for key, vals := range form {
+		if len(vals) == 0 {
+			continue
+		}
+		idxStr, ok := strings.CutPrefix(key, p)
+		if !ok {
+			continue
+		}
+		idx, err := strconv.Atoi(idxStr)
+		if err != nil {
+			continue
+		}
+		items = append(items, kv{idx: idx, val: vals[0]})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].idx < items[j].idx })
+	out := make([]string, len(items))
+	for i, it := range items {
+		out[i] = it.val
+	}
+	return out
+}
+
+// ParseTagPairs scans form for "<prefix>.N.Key"/"<prefix>.N.Value" pairs
+// (AWS's Tag.N.Key/Tag.N.Value convention, distinct from
+// ParseAttributePairs's Name/Value convention used elsewhere).
+func ParseTagPairs(form url.Values, prefix string) map[string]string {
+	grouped := ParseIndexedEntries(form, prefix)
+	out := make(map[string]string, len(grouped))
+	for _, e := range grouped {
+		if e["Key"] != "" {
+			out[e["Key"]] = e["Value"]
+		}
+	}
+	return out
 }
