@@ -1,8 +1,5 @@
-// Async Textract operations (StartDocumentTextDetection/GetDocumentTextDetection,
-// StartDocumentAnalysis/GetDocumentAnalysis). This emulator has no real
-// worker pool, so a "job" is actually processed synchronously inside the
-// Start call and simply read back on Get; that's enough to exercise an
-// SDK's poll loop without a background scheduler.
+// Async Textract operations. This emulator has no worker pool: a "job" is
+// processed synchronously inside Start and simply read back on Get.
 package textract
 
 import (
@@ -16,18 +13,13 @@ import (
 )
 
 // DocumentStore retrieves a stored S3 object; satisfied structurally by
-// *s3.Service. Declared here (rather than importing s3 into Processor's
-// constructor) so async Start calls can resolve a DocumentLocation.S3Object
-// without this package depending on how the caller wires S3 up.
+// *s3.Service, avoiding an import of s3 into this package.
 type DocumentStore interface {
 	GetObject(bucket, key string) (*s3.Object, error)
 }
 
-// JobStatus values mirror Textract's documented JobStatus enum
-// (IN_PROGRESS | SUCCEEDED | FAILED | PARTIAL_SUCCESS). This emulator has no
-// worker pool and no per-page failure model, so a job only ever settles as
-// JobStatusSucceeded or JobStatusFailed; IN_PROGRESS/PARTIAL_SUCCESS are
-// declared for shape parity but never produced.
+// JobStatus values mirror Textract's documented JobStatus enum. Only
+// Succeeded/Failed are ever produced; the rest exist for shape parity.
 const (
 	JobStatusInProgress     = "IN_PROGRESS"
 	JobStatusSucceeded      = "SUCCEEDED"
@@ -42,13 +34,16 @@ var ErrJobNotFound = errors.New("job does not exist")
 // when a DocumentLocation.S3Object can't be resolved via the DocumentStore.
 var ErrInvalidS3Object = errors.New("unable to access the S3 object")
 
-// AsyncJob is the stored result of a Start* call, read back by Get*.
+// AsyncJob is the stored result of a Start* call, read back by Get*; each
+// field is populated only by its corresponding Start* variant.
 type AsyncJob struct {
 	Status           string
 	StatusMessage    string
 	DocumentMetadata DocumentMetadata
 	Blocks           []Block
 	ModelVersion     string
+	ExpenseDocuments []ExpenseDocument
+	Lending          *LendingResult
 }
 
 // jobStore is the thread-safe registry of async jobs, keyed by JobId.
@@ -77,8 +72,7 @@ func (s *jobStore) get(id string) (*AsyncJob, bool) {
 }
 
 // fetchDocument resolves a DocumentLocation.S3Object via store, mapping any
-// failure to ErrInvalidS3Object the way real Textract rejects a
-// Start* call synchronously when it can't read the referenced object.
+// failure to ErrInvalidS3Object.
 func fetchDocument(store DocumentStore, bucket, key string) ([]byte, error) {
 	obj, err := store.GetObject(bucket, key)
 	if err != nil {
@@ -87,9 +81,8 @@ func fetchDocument(store DocumentStore, bucket, key string) ([]byte, error) {
 	return obj.Data, nil
 }
 
-// StartDocumentTextDetection resolves the S3 document and runs
-// DetectDocumentText, storing the outcome (success or decode failure) as a
-// completed job and returning its JobId.
+// StartDocumentTextDetection resolves the S3 document, runs
+// DetectDocumentText, and stores the outcome as a completed job.
 func (p *Processor) StartDocumentTextDetection(store DocumentStore, bucket, key string) (string, error) {
 	raw, err := fetchDocument(store, bucket, key)
 	if err != nil {
@@ -121,10 +114,7 @@ func (p *Processor) GetDocumentTextDetection(jobID string) (*AsyncJob, error) {
 }
 
 // StartDocumentAnalysis resolves the S3 document and runs AnalyzeDocument.
-// FeatureTypes validation errors (ErrInvalidParameter) are surfaced
-// synchronously, matching real Textract's eager parameter validation on
-// Start*; decode failures are stored as a FAILED job instead, since real
-// Textract only discovers those once the (real) async worker runs.
+// FeatureTypes validation errors surface synchronously; decode failures are stored as a FAILED job.
 func (p *Processor) StartDocumentAnalysis(store DocumentStore, bucket, key string, featureTypes []string) (string, error) {
 	raw, err := fetchDocument(store, bucket, key)
 	if err != nil {
@@ -156,4 +146,84 @@ func (p *Processor) GetDocumentAnalysis(jobID string) (*AsyncJob, error) {
 		return nil, ErrJobNotFound
 	}
 	return job, nil
+}
+
+// StartExpenseAnalysis resolves the S3 document and runs AnalyzeExpense,
+// storing the outcome as a completed job and returning its JobId.
+func (p *Processor) StartExpenseAnalysis(store DocumentStore, bucket, key string) (string, error) {
+	raw, err := fetchDocument(store, bucket, key)
+	if err != nil {
+		return "", err
+	}
+
+	job := &AsyncJob{}
+	out, err := p.AnalyzeExpense(raw)
+	if err != nil {
+		job.Status = JobStatusFailed
+		job.StatusMessage = err.Error()
+	} else {
+		job.Status = JobStatusSucceeded
+		job.DocumentMetadata = DocumentMetadata{Pages: 1}
+		job.ExpenseDocuments = out.ExpenseDocuments
+	}
+	return p.jobs.put(job), nil
+}
+
+// GetExpenseAnalysis looks up a job started by StartExpenseAnalysis.
+func (p *Processor) GetExpenseAnalysis(jobID string) (*AsyncJob, error) {
+	job, ok := p.jobs.get(jobID)
+	if !ok {
+		return nil, ErrJobNotFound
+	}
+	return job, nil
+}
+
+// StartLendingAnalysis resolves the S3 document, runs the lending
+// classification/extraction heuristic, and stores the outcome as a completed job.
+func (p *Processor) StartLendingAnalysis(store DocumentStore, bucket, key string) (string, error) {
+	raw, err := fetchDocument(store, bucket, key)
+	if err != nil {
+		return "", err
+	}
+
+	job := &AsyncJob{}
+	out, err := p.analyzeLending(raw)
+	if err != nil {
+		job.Status = JobStatusFailed
+		job.StatusMessage = err.Error()
+	} else {
+		job.Status = JobStatusSucceeded
+		job.DocumentMetadata = DocumentMetadata{Pages: 1}
+		job.Lending = out
+	}
+	return p.jobs.put(job), nil
+}
+
+// GetLendingAnalysis looks up a job started by StartLendingAnalysis.
+func (p *Processor) GetLendingAnalysis(jobID string) (*AsyncJob, error) {
+	job, ok := p.jobs.get(jobID)
+	if !ok {
+		return nil, ErrJobNotFound
+	}
+	return job, nil
+}
+
+// GetLendingAnalysisSummary looks up a job and reshapes its result into
+// DocumentGroups, grouping pages by classified DocumentType.
+func (p *Processor) GetLendingAnalysisSummary(jobID string) (*AsyncJob, *LendingSummary, error) {
+	job, ok := p.jobs.get(jobID)
+	if !ok {
+		return nil, nil, ErrJobNotFound
+	}
+	if job.Lending == nil {
+		return job, &LendingSummary{}, nil
+	}
+
+	docType := job.Lending.PageClassification.PageType[0].Value
+	return job, &LendingSummary{
+		DocumentGroups: []DocumentGroup{{
+			Type:           docType,
+			SplitDocuments: []SplitDocument{{Index: 1, Pages: []int{job.Lending.Page}}},
+		}},
+	}, nil
 }
