@@ -37,7 +37,7 @@ func NewEngine() *Engine {
 	snsSvc := sns.NewService(sqsSvc) // *sqs.Service satisfies sns.QueuePublisher
 	snsHandler := sns.NewHandler(snsSvc)
 
-	s3Svc := s3.NewService()
+	s3Svc := s3.NewService(snsSvc, sqsSvc) // *sns.Service satisfies s3.TopicPublisher, *sqs.Service satisfies s3.QueuePublisher
 	s3Handler := s3.NewHandler(s3Svc)
 
 	textractProc := textract.NewProcessor()

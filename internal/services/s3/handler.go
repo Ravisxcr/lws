@@ -44,6 +44,34 @@ type locationConstraint struct {
 	Value   string   `xml:",chardata"`
 }
 
+type filterRuleXML struct {
+	Name  string `xml:"Name"`
+	Value string `xml:"Value"`
+}
+type s3KeyFilterXML struct {
+	FilterRules []filterRuleXML `xml:"FilterRule"`
+}
+type notificationFilterXML struct {
+	S3Key s3KeyFilterXML `xml:"S3Key"`
+}
+type queueConfigurationXML struct {
+	ID     string                 `xml:"Id,omitempty"`
+	Queue  string                 `xml:"Queue"`
+	Events []string               `xml:"Event"`
+	Filter *notificationFilterXML `xml:"Filter,omitempty"`
+}
+type topicConfigurationXML struct {
+	ID     string                 `xml:"Id,omitempty"`
+	Topic  string                 `xml:"Topic"`
+	Events []string               `xml:"Event"`
+	Filter *notificationFilterXML `xml:"Filter,omitempty"`
+}
+type notificationConfigurationXML struct {
+	XMLName             xml.Name                `xml:"http://s3.amazonaws.com/doc/2006-03-01/ NotificationConfiguration"`
+	QueueConfigurations []queueConfigurationXML `xml:"QueueConfiguration,omitempty"`
+	TopicConfigurations []topicConfigurationXML `xml:"TopicConfiguration,omitempty"`
+}
+
 type xmlContent struct {
 	Key          string `xml:"Key"`
 	LastModified string `xml:"LastModified"`
@@ -190,7 +218,12 @@ func (h *Handler) routeBucket(w http.ResponseWriter, r *http.Request, bucket str
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodPut:
-		h.handleCreateBucket(w, r, bucket)
+		switch {
+		case q.Has("notification"):
+			h.handlePutBucketNotificationConfiguration(w, r, bucket)
+		default:
+			h.handleCreateBucket(w, r, bucket)
+		}
 	case http.MethodDelete:
 		h.handleDeleteBucket(w, r, bucket)
 	case http.MethodHead:
@@ -199,6 +232,8 @@ func (h *Handler) routeBucket(w http.ResponseWriter, r *http.Request, bucket str
 		switch {
 		case q.Has("location"):
 			h.handleGetBucketLocation(w, r, bucket)
+		case q.Has("notification"):
+			h.handleGetBucketNotificationConfiguration(w, r, bucket)
 		case q.Has("uploads"):
 			h.handleListMultipartUploads(w, r, bucket)
 		case q.Get("list-type") == "2":
@@ -314,6 +349,94 @@ func (h *Handler) handleGetBucketLocation(w http.ResponseWriter, r *http.Request
 		loc = "" // real S3 returns an empty LocationConstraint for the default region
 	}
 	awsutil.WriteXML(w, http.StatusOK, locationConstraint{Value: loc})
+}
+
+func (h *Handler) handleGetBucketNotificationConfiguration(w http.ResponseWriter, r *http.Request, bucket string) {
+	cfg, err := h.svc.GetBucketNotificationConfiguration(bucket)
+	if err != nil {
+		writeServiceError(w, err, bucket)
+		return
+	}
+	out := notificationConfigurationXML{}
+	for _, qc := range cfg.QueueConfigs {
+		out.QueueConfigurations = append(out.QueueConfigurations, queueConfigurationXML{
+			ID:     qc.ID,
+			Queue:  qc.QueueArn,
+			Events: qc.Events,
+			Filter: filterToXML(qc.Filter),
+		})
+	}
+	for _, tc := range cfg.TopicConfigs {
+		out.TopicConfigurations = append(out.TopicConfigurations, topicConfigurationXML{
+			ID:     tc.ID,
+			Topic:  tc.TopicArn,
+			Events: tc.Events,
+			Filter: filterToXML(tc.Filter),
+		})
+	}
+	awsutil.WriteXML(w, http.StatusOK, out)
+}
+
+func (h *Handler) handlePutBucketNotificationConfiguration(w http.ResponseWriter, r *http.Request, bucket string) {
+	var req notificationConfigurationXML
+	if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "failed to parse request body: "+err.Error(), bucket)
+		return
+	}
+	cfg := &NotificationConfig{}
+	for _, qc := range req.QueueConfigurations {
+		cfg.QueueConfigs = append(cfg.QueueConfigs, QueueConfig{
+			ID:       qc.ID,
+			QueueArn: qc.Queue,
+			Events:   qc.Events,
+			Filter:   filterFromXML(qc.Filter),
+		})
+	}
+	for _, tc := range req.TopicConfigurations {
+		cfg.TopicConfigs = append(cfg.TopicConfigs, TopicConfig{
+			ID:       tc.ID,
+			TopicArn: tc.Topic,
+			Events:   tc.Events,
+			Filter:   filterFromXML(tc.Filter),
+		})
+	}
+	if err := h.svc.PutBucketNotificationConfiguration(bucket, cfg); err != nil {
+		writeServiceError(w, err, bucket)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// filterToXML renders a KeyFilter as S3's Filter>S3Key>FilterRule shape,
+// omitting the element entirely when the filter has no rules.
+func filterToXML(f KeyFilter) *notificationFilterXML {
+	if f.Prefix == "" && f.Suffix == "" {
+		return nil
+	}
+	nf := &notificationFilterXML{}
+	if f.Prefix != "" {
+		nf.S3Key.FilterRules = append(nf.S3Key.FilterRules, filterRuleXML{Name: "prefix", Value: f.Prefix})
+	}
+	if f.Suffix != "" {
+		nf.S3Key.FilterRules = append(nf.S3Key.FilterRules, filterRuleXML{Name: "suffix", Value: f.Suffix})
+	}
+	return nf
+}
+
+func filterFromXML(f *notificationFilterXML) KeyFilter {
+	var kf KeyFilter
+	if f == nil {
+		return kf
+	}
+	for _, rule := range f.S3Key.FilterRules {
+		switch strings.ToLower(rule.Name) {
+		case "prefix":
+			kf.Prefix = rule.Value
+		case "suffix":
+			kf.Suffix = rule.Value
+		}
+	}
+	return kf
 }
 
 func (h *Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -642,7 +765,11 @@ func setObjectHeaders(w http.ResponseWriter, obj *Object) {
 	w.Header().Set("ETag", quote(obj.ETag))
 	w.Header().Set("Last-Modified", obj.LastModified.Format(http.TimeFormat))
 	for k, v := range obj.Metadata {
-		w.Header().Set("x-amz-meta-"+k, v)
+		// Set() canonicalizes to "X-Amz-Meta-Author"; real S3 (and boto3's
+		// parsing of the response, which strips the literal prefix) expects
+		// the wire header name to stay all-lowercase, so bypass Set/Add and
+		// write the map key directly.
+		w.Header()["x-amz-meta-"+k] = []string{v}
 	}
 }
 

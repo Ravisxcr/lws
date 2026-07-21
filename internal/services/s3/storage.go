@@ -7,6 +7,7 @@ package s3
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,15 +44,57 @@ type multipartUpload struct {
 	parts map[int]*Part
 }
 
+// KeyFilter restricts a notification configuration to keys matching a
+// prefix and/or suffix (S3's Filter.S3Key.FilterRules).
+type KeyFilter struct {
+	Prefix string
+	Suffix string
+}
+
+// Matches reports whether key satisfies every non-empty rule in f.
+func (f KeyFilter) Matches(key string) bool {
+	if f.Prefix != "" && !strings.HasPrefix(key, f.Prefix) {
+		return false
+	}
+	if f.Suffix != "" && !strings.HasSuffix(key, f.Suffix) {
+		return false
+	}
+	return true
+}
+
+// QueueConfig delivers matching events directly to an SQS queue.
+type QueueConfig struct {
+	ID       string
+	QueueArn string
+	Events   []string
+	Filter   KeyFilter
+}
+
+// TopicConfig delivers matching events to an SNS topic.
+type TopicConfig struct {
+	ID       string
+	TopicArn string
+	Events   []string
+	Filter   KeyFilter
+}
+
+// NotificationConfig is a bucket's event notification configuration, as set
+// by PutBucketNotificationConfiguration.
+type NotificationConfig struct {
+	QueueConfigs []QueueConfig
+	TopicConfigs []TopicConfig
+}
+
 // Bucket is a single S3 bucket: an immutable identity plus the mutable
 // concurrency-protected state backing its objects and multipart uploads.
 type Bucket struct {
 	Name         string
 	CreationDate time.Time
 
-	mu      sync.RWMutex
-	objects map[string]*Object
-	uploads map[string]*multipartUpload
+	mu           sync.RWMutex
+	objects      map[string]*Object
+	uploads      map[string]*multipartUpload
+	notification *NotificationConfig
 }
 
 // Storage is the thread-safe registry of all buckets, keyed by name.
@@ -146,6 +189,21 @@ func (b *Bucket) Delete(key string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.objects, key)
+}
+
+// SetNotificationConfig replaces the bucket's event notification config.
+func (b *Bucket) SetNotificationConfig(cfg *NotificationConfig) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.notification = cfg
+}
+
+// NotificationConfig returns the bucket's current event notification config,
+// or nil if none has been set.
+func (b *Bucket) NotificationConfig() *NotificationConfig {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.notification
 }
 
 // List returns every object, sorted by key for deterministic pagination.

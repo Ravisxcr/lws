@@ -29,9 +29,6 @@ const (
 
 // ErrJobNotFound mirrors Textract's InvalidJobIdException.
 var ErrJobNotFound = errors.New("job does not exist")
-
-// ErrInvalidS3Object mirrors Textract's InvalidS3ObjectException, returned
-// when a DocumentLocation.S3Object can't be resolved via the DocumentStore.
 var ErrInvalidS3Object = errors.New("unable to access the S3 object")
 
 // AsyncJob is the stored result of a Start* call, read back by Get*; each
