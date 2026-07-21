@@ -1,13 +1,5 @@
-// Package textract emulates the AWS Textract DetectDocumentText and
-// AnalyzeDocument APIs using real OpenCV (gocv) preprocessing and real
-// Tesseract (gosseract) OCR.
-//
-// FORMS and TABLES detection are heuristic approximations, not an ML-grade
-// layout model: TABLES uses morphological line detection to find table
-// grids, and FORMS anchors each key to a real detected underline/rule
-// first, falling back to spatial proximity when no drawn line is found.
-// The goal is to faithfully reproduce the JSON Block-tree *shape* AWS SDKs
-// expect, not pixel-perfect parity with Textract's real accuracy.
+// Package textract emulates AWS Textract using real OpenCV/Tesseract OCR;
+// FORMS/TABLES are heuristic approximations of the response *shape*, not ML.
 package textract
 
 import (
@@ -21,9 +13,8 @@ import (
 	"gocv.io/x/gocv"
 )
 
-// structuralConfidence is the fixed confidence assigned to blocks with no
-// natural OCR-derived score (PAGE, TABLE, CELL, KEY_VALUE_SET) — OpenCV
-// contour detection has no natural probabilistic confidence of its own.
+// structuralConfidence is the fixed confidence for blocks with no natural
+// OCR-derived score (PAGE, TABLE, CELL, KEY_VALUE_SET).
 const structuralConfidence = 90.0
 
 var (
@@ -76,12 +67,8 @@ type Block struct {
 	Page            int            `json:"Page"`
 }
 
-// MarshalJSON emits Text (even when empty) for WORD/LINE blocks — the only
-// types real Textract populates it for — and omits it entirely for every
-// other BlockType, matching AWS's shape exactly. A plain `omitempty` tag on
-// Text can't express this: it would drop Text for a WORD/LINE with no
-// recognized characters too, which broke SDK code that indexes resp["Text"]
-// unconditionally on every LINE block.
+// MarshalJSON emits Text for WORD/LINE blocks even when empty, and omits it for
+// every other BlockType; a plain `omitempty` tag can't express that distinction.
 func (b Block) MarshalJSON() ([]byte, error) {
 	type alias Block
 	out := struct {
@@ -99,9 +86,8 @@ type DocumentMetadata struct {
 	Pages int `json:"Pages"`
 }
 
-// Warning mirrors Textract's Warning shape, surfaced in async Get*
-// responses when a page couldn't be fully processed. This emulator never
-// produces partial failures, so callers always see an empty/omitted list.
+// Warning mirrors Textract's Warning shape; this emulator never produces
+// partial failures, so callers always see an empty/omitted list.
 type Warning struct {
 	ErrorCode string `json:"ErrorCode"`
 	Pages     []int  `json:"Pages,omitempty"`
@@ -123,16 +109,17 @@ type AnalyzeDocumentOutput struct {
 	Blocks                      []Block          `json:"Blocks"`
 }
 
-// Processor turns raw document bytes into Textract-shaped Block trees. The
-// only state it carries is the in-memory async job store used by
-// StartDocumentTextDetection/StartDocumentAnalysis.
+// Processor turns raw document bytes into Textract-shaped Block trees, and
+// carries the async job store and adapter registry.
 type Processor struct {
-	jobs *jobStore
+	jobs     *jobStore
+	adapters *adapterStore
 }
 
-// NewProcessor returns a Textract processor with an empty async job store.
+// NewProcessor returns a Textract processor with empty job and adapter
+// stores.
 func NewProcessor() *Processor {
-	return &Processor{jobs: newJobStore()}
+	return &Processor{jobs: newJobStore(), adapters: newAdapterStore()}
 }
 
 // --- block-tree builder ---
@@ -177,9 +164,7 @@ func (b *builder) add(block Block) string {
 }
 
 // placedWord/placedLine carry a block's already-minted Id alongside its
-// pixel-space box, so downstream FORMS/TABLES augmentation can reference
-// the exact same WORD blocks emitted by the base OCR pass instead of
-// re-deriving them.
+// pixel-space box, for downstream FORMS/TABLES augmentation to reuse.
 type placedWord struct {
 	ID   string
 	Box  image.Rectangle
@@ -194,11 +179,8 @@ type placedLine struct {
 	WordIDs    []string
 }
 
-// buildTextBlocks runs the shared pipeline (decode -> preprocess ->
-// re-encode -> Tesseract) and emits PAGE/LINE/WORD blocks. It returns the
-// builder for further augmentation, the placed lines/words for FORMS/
-// TABLES heuristics, and the binary Mat used for layout detection —
-// callers must Close() the returned *gocv.Mat.
+// buildTextBlocks runs decode -> preprocess -> re-encode -> Tesseract and emits
+// PAGE/LINE/WORD blocks; callers must Close() the returned *gocv.Mat.
 func (p *Processor) buildTextBlocks(raw []byte) (*builder, []placedLine, []placedWord, *gocv.Mat, error) {
 	decoded, err := DecodeImage(raw)
 	if err != nil {
@@ -329,11 +311,8 @@ func (p *Processor) AnalyzeDocument(raw []byte, featureTypes []string) (*Analyze
 	}, nil
 }
 
-// addTables emits TABLE and CELL blocks for each detected table region,
-// assigning each already-OCR'd word to the cell whose rectangle contains
-// the word's center point. CELL blocks carry no direct Text field —
-// matching real Textract, where cell text is derived by walking CHILD
-// word ids.
+// addTables emits TABLE and CELL blocks per detected table region, assigning
+// each OCR'd word to the cell containing its center point.
 func (p *Processor) addTables(b *builder, bin *gocv.Mat, tables []image.Rectangle, words []placedWord) {
 	for _, table := range tables {
 		grid := DetectCellGrids(bin, table)
@@ -368,11 +347,8 @@ func (p *Processor) addTables(b *builder, bin *gocv.Mat, tables []image.Rectangl
 	}
 }
 
-// formValue is a form field's value: either an OCR line bound to a key —
-// via its underline anchor or, failing that, layout proximity — or, when a
-// detected underline has no OCR text over its writable area, an empty
-// value box. Real Textract emits a VALUE block even for a blank form
-// field, so an empty formValue still produces one.
+// formValue is a form field's value: an OCR line bound to a key, or an empty
+// box when a detected underline has no text above it.
 type formValue struct {
 	Box        image.Rectangle
 	Text       string
@@ -387,22 +363,8 @@ type kvPair struct {
 	Value formValue
 }
 
-// pairKeyValues pairs lines into key/value fields. A line ending in ':'
-// (or short text, <=4 words) is treated as a KEY candidate. Its value is
-// found in two passes:
-//  1. Anchor to a real drawn underline/rule (the same morphological line
-//     detection TABLES uses): the nearest unclaimed underline to the
-//     key's right in the same horizontal band, or failing that, directly
-//     below with a similar left edge. Whatever OCR line overlaps the
-//     writable area just above that underline becomes the value; if none
-//     does, the field is still emitted with an empty value, matching a
-//     blank form field.
-//  2. Falling back to pure layout proximity (nearest unclaimed line to
-//     the right, then below) when no underline anchor was found.
-//
-// Shared by the FORMS feature (addKeyValueSets) and AnalyzeExpense, which
-// both need the same key/value layout heuristic but emit it in different
-// output shapes.
+// pairKeyValues pairs lines into key/value fields: keys are lines ending in ':'
+// or short text; values are found via underline anchor, else layout proximity.
 func pairKeyValues(lines []placedLine, tableRegions []image.Rectangle, underlines []image.Rectangle) []kvPair {
 	claimed := make(map[string]bool, len(lines))
 	claimedUnderlines := make([]bool, len(underlines))
@@ -446,13 +408,8 @@ func pairKeyValues(lines []placedLine, tableRegions []image.Rectangle, underline
 	return pairs
 }
 
-// findValueViaUnderline anchors key's value to the nearest unclaimed
-// detected underline (same search order as the proximity fallback: same
-// band to the right, else directly below with a similar left edge), then
-// binds whichever OCR line overlaps the writable area just above that
-// underline. Returns nil if no underline anchor is found at all — a
-// found-but-empty underline still yields a (blank) formValue, since the
-// underline itself is real CV signal that a field exists there.
+// findValueViaUnderline anchors key's value to the nearest unclaimed detected
+// underline, binding whichever OCR line overlaps the area just above it.
 func findValueViaUnderline(key placedLine, underlines []image.Rectangle, claimedUnderlines []bool, lines []placedLine, claimedLines map[string]bool, inTable func(image.Rectangle) bool) *formValue {
 	idx := nearestUnderlineToRight(key, underlines, claimedUnderlines)
 	if idx < 0 {
@@ -480,9 +437,8 @@ func findValueViaUnderline(key placedLine, underlines []image.Rectangle, claimed
 	return &formValue{Box: underline, Confidence: structuralConfidence}
 }
 
-// nearestUnclaimedUnderline shares the two underline-search passes needed
-// by findValueViaUnderline. within reports whether candidate underline u
-// lies in the direction/band expected relative to key.
+// nearestUnclaimedUnderline shares the two underline-search passes needed by
+// findValueViaUnderline; within reports whether u matches the expected band.
 func nearestUnclaimedUnderline(key placedLine, underlines []image.Rectangle, claimed []bool, within func(u image.Rectangle) (ok bool, dist int)) int {
 	best := -1
 	bestDist := 0

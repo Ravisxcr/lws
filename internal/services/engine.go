@@ -1,6 +1,5 @@
-// Package services is the composition root tying together every emulated
-// AWS service (SQS, SNS, Textract) into a single Engine consumed by the
-// router.
+// Package services is the composition root tying every emulated AWS service
+// into a single Engine consumed by the router.
 package services
 
 import (
@@ -38,11 +37,11 @@ func NewEngine() *Engine {
 	snsSvc := sns.NewService(sqsSvc) // *sqs.Service satisfies sns.QueuePublisher
 	snsHandler := sns.NewHandler(snsSvc)
 
-	s3Svc := s3.NewService()
+	s3Svc := s3.NewService(snsSvc, sqsSvc) // *sns.Service satisfies s3.TopicPublisher, *sqs.Service satisfies s3.QueuePublisher
 	s3Handler := s3.NewHandler(s3Svc)
 
 	textractProc := textract.NewProcessor()
-	textractHandler := textract.NewHandler(textractProc, s3Svc) // *s3.Service satisfies textract.DocumentStore
+	textractHandler := textract.NewHandler(textractProc, s3Svc, snsSvc) // *s3.Service satisfies textract.DocumentStore, *sns.Service satisfies textract.Notifier
 
 	secretsManagerSvc := secretsmanager.NewService()
 	secretsManagerHandler := secretsmanager.NewHandler(secretsManagerSvc)

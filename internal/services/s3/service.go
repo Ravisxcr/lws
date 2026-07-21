@@ -3,8 +3,10 @@ package s3
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -44,14 +46,30 @@ type ListResult struct {
 	NextMarker     string // continuation token (v2) or next marker (v1)
 }
 
-// Service implements S3's core domain logic over the thread-safe Storage.
-type Service struct {
-	store *Storage
+// TopicPublisher publishes an S3 event notification to an SNS topic;
+// satisfied structurally by *sns.Service.
+type TopicPublisher interface {
+	Publish(topicArn, message, subject string) (string, error)
 }
 
-// NewService returns an S3 service with an empty bucket registry.
-func NewService() *Service {
-	return &Service{store: NewStorage()}
+// QueuePublisher delivers an S3 event notification directly to an SQS
+// queue; satisfied structurally by *sqs.Service.
+type QueuePublisher interface {
+	Enqueue(queueName, body string) error
+}
+
+// Service implements S3's core domain logic over the thread-safe Storage.
+type Service struct {
+	store  *Storage
+	topics TopicPublisher
+	queues QueuePublisher
+}
+
+// NewService returns an S3 service with an empty bucket registry. topics
+// and queues (may be nil) back bucket event notifications configured via
+// PutBucketNotificationConfiguration.
+func NewService(topics TopicPublisher, queues QueuePublisher) *Service {
+	return &Service{store: NewStorage(), topics: topics, queues: queues}
 }
 
 // --- buckets ---
@@ -97,6 +115,30 @@ func (s *Service) getBucket(name string) (*Bucket, error) {
 	return b, nil
 }
 
+// PutBucketNotificationConfiguration replaces bucket's event notification
+// config. A nil cfg (or one with no configs) clears it.
+func (s *Service) PutBucketNotificationConfiguration(bucket string, cfg *NotificationConfig) error {
+	b, err := s.getBucket(bucket)
+	if err != nil {
+		return err
+	}
+	b.SetNotificationConfig(cfg)
+	return nil
+}
+
+// GetBucketNotificationConfiguration returns bucket's current event
+// notification config, or an empty one if none has been set.
+func (s *Service) GetBucketNotificationConfiguration(bucket string) (*NotificationConfig, error) {
+	b, err := s.getBucket(bucket)
+	if err != nil {
+		return nil, err
+	}
+	if cfg := b.NotificationConfig(); cfg != nil {
+		return cfg, nil
+	}
+	return &NotificationConfig{}, nil
+}
+
 // --- objects ---
 
 // PutObject stores data under key in bucket, computing its ETag (MD5) and
@@ -119,6 +161,7 @@ func (s *Service) PutObject(bucket, key string, data []byte, contentType string,
 		Metadata:     metadata,
 	}
 	b.Put(obj)
+	s.notify(b, bucket, "ObjectCreated:Put", obj)
 	return obj, nil
 }
 
@@ -146,7 +189,10 @@ func (s *Service) DeleteObject(bucket, key string) error {
 	if err != nil {
 		return err
 	}
-	b.Delete(key)
+	if obj, ok := b.Get(key); ok {
+		b.Delete(key)
+		s.notify(b, bucket, "ObjectRemoved:Delete", obj)
+	}
 	return nil
 }
 
@@ -158,7 +204,10 @@ func (s *Service) DeleteObjects(bucket string, keys []string) error {
 		return err
 	}
 	for _, key := range keys {
-		b.Delete(key)
+		if obj, ok := b.Get(key); ok {
+			b.Delete(key)
+			s.notify(b, bucket, "ObjectRemoved:Delete", obj)
+		}
 	}
 	return nil
 }
@@ -194,6 +243,7 @@ func (s *Service) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, newMet
 		Tags:         src.Tags,
 	}
 	dst.Put(obj)
+	s.notify(dst, dstBucket, "ObjectCreated:Copy", obj)
 	return obj, nil
 }
 
@@ -412,5 +462,110 @@ func (s *Service) CompleteMultipartUpload(bucket, key, uploadID string, complete
 	}
 	b.Put(obj)
 	b.RemoveUpload(uploadID)
+	s.notify(b, bucket, "ObjectCreated:CompleteMultipartUpload", obj)
 	return obj, nil
+}
+
+// --- event notifications ---
+
+type eventRecord struct {
+	EventVersion string        `json:"eventVersion"`
+	EventSource  string        `json:"eventSource"`
+	AWSRegion    string        `json:"awsRegion"`
+	EventTime    string        `json:"eventTime"`
+	EventName    string        `json:"eventName"`
+	S3           eventRecordS3 `json:"s3"`
+}
+type eventRecordS3 struct {
+	SchemaVersion string            `json:"s3SchemaVersion"`
+	Bucket        eventRecordBucket `json:"bucket"`
+	Object        eventRecordObject `json:"object"`
+}
+type eventRecordBucket struct {
+	Name string `json:"name"`
+	Arn  string `json:"arn"`
+}
+type eventRecordObject struct {
+	Key  string `json:"key"`
+	Size int64  `json:"size"`
+	ETag string `json:"eTag"`
+}
+type eventNotification struct {
+	Records []eventRecord `json:"Records"`
+}
+
+// notify publishes an S3 event notification (eventName without the "s3:"
+// prefix, e.g. "ObjectCreated:Put") to every QueueConfig/TopicConfig on
+// bucket whose Events and Filter match key. Best-effort: publish failures
+// are logged, not returned, so they never fail the underlying object
+// operation.
+func (s *Service) notify(b *Bucket, bucketName, eventName string, obj *Object) {
+	cfg := b.NotificationConfig()
+	if cfg == nil {
+		return
+	}
+	body, err := json.Marshal(eventNotification{Records: []eventRecord{{
+		EventVersion: "2.1",
+		EventSource:  "aws:s3",
+		AWSRegion:    region,
+		EventTime:    time.Now().UTC().Format(time.RFC3339),
+		EventName:    eventName,
+		S3: eventRecordS3{
+			SchemaVersion: "1.0",
+			Bucket:        eventRecordBucket{Name: bucketName, Arn: fmt.Sprintf("arn:aws:s3:::%s", bucketName)},
+			Object:        eventRecordObject{Key: obj.Key, Size: int64(len(obj.Data)), ETag: obj.ETag},
+		},
+	}}})
+	if err != nil {
+		log.Printf("s3: failed to marshal event notification: %v", err)
+		return
+	}
+
+	for _, qc := range cfg.QueueConfigs {
+		if !matchesEvent(qc.Events, eventName) || !qc.Filter.Matches(obj.Key) {
+			continue
+		}
+		if s.queues == nil {
+			continue
+		}
+		if err := s.queues.Enqueue(queueNameFromArn(qc.QueueArn), string(body)); err != nil {
+			log.Printf("s3: failed to deliver event notification to queue %s: %v", qc.QueueArn, err)
+		}
+	}
+	for _, tc := range cfg.TopicConfigs {
+		if !matchesEvent(tc.Events, eventName) || !tc.Filter.Matches(obj.Key) {
+			continue
+		}
+		if s.topics == nil {
+			continue
+		}
+		if _, err := s.topics.Publish(tc.TopicArn, string(body), "Amazon S3 Notification"); err != nil {
+			log.Printf("s3: failed to deliver event notification to topic %s: %v", tc.TopicArn, err)
+		}
+	}
+}
+
+// matchesEvent reports whether eventName (e.g. "ObjectCreated:Put") is
+// covered by any entry in configured (e.g. "s3:ObjectCreated:*" or
+// "s3:ObjectCreated:Put").
+func matchesEvent(configured []string, eventName string) bool {
+	full := "s3:" + eventName
+	for _, c := range configured {
+		if c == full {
+			return true
+		}
+		if strings.HasSuffix(c, ":*") && strings.HasPrefix(full, strings.TrimSuffix(c, "*")) {
+			return true
+		}
+	}
+	return false
+}
+
+// queueNameFromArn extracts the queue name from an
+// "arn:aws:sqs:<region>:<account>:<name>" ARN.
+func queueNameFromArn(arn string) string {
+	if idx := strings.LastIndex(arn, ":"); idx != -1 {
+		return arn[idx+1:]
+	}
+	return arn
 }
